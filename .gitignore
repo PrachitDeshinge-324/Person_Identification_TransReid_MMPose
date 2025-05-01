@@ -1,0 +1,12 @@
+# Ignore all MP4 files
+*.mp4
+
+# Ignore model weights
+*.h5
+*.ckpt
+*.pth
+*.pt
+
+# Ignore logs
+logs/
+*.log

@@ -1,0 +1,20 @@
+torch>=1.7.0
+torchvision>=0.8.0
+opencv-python>=4.5.1
+numpy>=1.19.5
+Pillow>=8.1.0
+tqdm
+matplotlib
+timm>=0.4.12
+transformers>=4.8.2
+ultralytics>=8.0.0
+filterpy>=1.4.5
+scipy>=1.7.0
+mediapipe
+
+# Add MMPose and MMEngine dependencies
+mmpose
+mmcv>=2.0.0rc4,<2.2.0
+mmengine
+torch
+opencv-python

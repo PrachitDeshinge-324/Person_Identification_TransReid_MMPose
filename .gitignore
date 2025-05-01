@@ -10,3 +10,4 @@
 # Ignore logs
 logs/
 *.log
+*.txt

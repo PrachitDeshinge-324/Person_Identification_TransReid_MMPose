@@ -14,7 +14,7 @@ from scipy.spatial.distance import cdist
 class PersonTracker:
     def __init__(self, yolo_weights_path, transreid_weights_path, 
                  device=None, conf_threshold=0.3, reid_threshold=0.7,
-                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False):
+                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False, mmpose_weights=None):
         """Initialize the person tracker with robust tracking capabilities"""
         # Use the best available device if none specified
         self.device = device if device is not None else get_best_device()
@@ -64,6 +64,9 @@ class PersonTracker:
         self.skeleton_missing_count = 0
         self.skeleton_total_count = 0
         self.last_debug_info = {}
+        
+        # MMPose weights
+        self.mmpose_weights = mmpose_weights
     
     def _extract_color_histogram(self, image):
         """Extract a normalized color histogram from the person crop (HSV, 16 bins per channel)."""
@@ -173,19 +176,27 @@ class PersonTracker:
         dist = np.linalg.norm(v1 - v2) / (np.linalg.norm(v1) + np.linalg.norm(v2) + 1e-6)
         return 1.0 - dist
 
-    def _calculate_gait_similarity(self, gait1, gait2):
+    def _calculate_gait_similarity(self, gait1, gait2, ratios1=None, ratios2=None):
         """
-        Calculate similarity between two gait feature dicts.
+        Calculate similarity between two gait feature dicts, including body ratios for scale invariance.
         """
         if not gait1 or not gait2:
             return 0.0
-        keys = set(gait1.keys()) & set(gait2.keys())
-        if not keys:
-            return 0.0
-        v1 = np.array([gait1[k] for k in keys])
-        v2 = np.array([gait2[k] for k in keys])
-        dist = np.linalg.norm(v1 - v2) / (np.linalg.norm(v1) + np.linalg.norm(v2) + 1e-6)
-        return 1.0 - dist
+        gait_keys = set(gait1.keys()) & set(gait2.keys())
+        gait_v1 = np.array([gait1[k] for k in gait_keys])
+        gait_v2 = np.array([gait2[k] for k in gait_keys])
+        gait_dist = np.linalg.norm(gait_v1 - gait_v2) / (np.linalg.norm(gait_v1) + np.linalg.norm(gait_v2) + 1e-6) if gait_keys else 1.0
+        ratio_score = 0.0
+        if ratios1 and ratios2:
+            ratio_keys = set(ratios1.keys()) & set(ratios2.keys())
+            if ratio_keys:
+                r1 = np.array([ratios1[k] for k in ratio_keys])
+                r2 = np.array([ratios2[k] for k in ratio_keys])
+                ratio_dist = np.linalg.norm(r1 - r2) / (np.linalg.norm(r1) + np.linalg.norm(r2) + 1e-6)
+                ratio_score = 1.0 - ratio_dist
+        gait_score = 1.0 - gait_dist
+        # Weighted sum: 70% temporal gait, 30% body ratios
+        return 0.7 * gait_score + 0.3 * ratio_score
 
     def _update_identity_gallery(self, track_id, color_hist=None, height=None):
         """Update the identity gallery with the latest features for a track."""
@@ -216,7 +227,7 @@ class PersonTracker:
             app_score = self._calculate_appearance_similarity(feature, entry['appearance']) if entry['appearance'] is not None and feature is not None else 0.0
             score += self.appearance_weight * app_score
             # Gait
-            gait_score = self._calculate_gait_similarity(gait, entry['gait']) if entry['gait'] and gait else 0.0
+            gait_score = self._calculate_gait_similarity(gait, entry['gait'], body, entry['body']) if entry['gait'] and gait else 0.0
             score += self.gait_weight * gait_score
             # Body
             body_score = self._calculate_body_similarity(body, entry['body']) if entry['body'] and body else 0.0
@@ -310,7 +321,7 @@ class PersonTracker:
             # Extract skeleton keypoints and body ratios
             print(f"Processing track {track_id} with bbox {bbox} and confidence {conf:.2f}")
             # Pass the full 'frame' instead of 'person_crop'
-            keypoints = extract_skeleton_keypoints(frame, bbox=[x1, y1, x2, y2], conf=conf) 
+            keypoints = extract_skeleton_keypoints(frame, bbox=[x1, y1, x2, y2], conf=conf, weights=self.mmpose_weights, device=self.device) 
             body_ratios = compute_body_ratios(keypoints) if keypoints else {}
             
             # Skeleton detection monitoring
@@ -382,8 +393,9 @@ class PersonTracker:
                         body_score = self._calculate_body_similarity(body_ratios, prev_ratios)
                     if track_id in self.gait_history and self.gait_history[track_id]:
                         prev_gait = self.gait_history[track_id][-1]
-                        gait = compute_gait_features(self.skeleton_history[track_id]) if track_id in self.skeleton_history else {}
-                        gait_score = self._calculate_gait_similarity(gait, prev_gait)
+                        prev_ratios = self.body_ratio_history[track_id][-1] if track_id in self.body_ratio_history and self.body_ratio_history[track_id] else None
+                        gait, ratios = compute_gait_features(self.skeleton_history[track_id]) if track_id in self.skeleton_history else ({}, {})
+                        gait_score = self._calculate_gait_similarity(gait, prev_gait, body_ratios, prev_ratios)
                     
                     # Compare color histograms
                     color_score = 0.0
@@ -425,8 +437,9 @@ class PersonTracker:
                         body_score = self._calculate_body_similarity(body_ratios, prev_ratios)
                     if track_id in self.gait_history and self.gait_history[track_id]:
                         prev_gait = self.gait_history[track_id][-1]
-                        gait = compute_gait_features(self.skeleton_history[track_id]) if track_id in self.skeleton_history else {}
-                        gait_score = self._calculate_gait_similarity(gait, prev_gait)
+                        prev_ratios = self.body_ratio_history[track_id][-1] if track_id in self.body_ratio_history and self.body_ratio_history[track_id] else None
+                        gait, ratios = compute_gait_features(self.skeleton_history[track_id]) if track_id in self.skeleton_history else ({}, {})
+                        gait_score = self._calculate_gait_similarity(gait, prev_gait, body_ratios, prev_ratios)
                     
                     # Compare color histograms
                     color_score = 0.0
@@ -544,10 +557,14 @@ class PersonTracker:
         # Compute gait features for each track
         for track_id in current_tracks:
             if track_id in self.skeleton_history:
-                gait = compute_gait_features(self.skeleton_history[track_id])
+                gait, ratios = compute_gait_features(self.skeleton_history[track_id])
                 if track_id not in self.gait_history:
                     self.gait_history[track_id] = []
                 self.gait_history[track_id].append(gait)
+                # Also update body_ratio_history with ratios from gait
+                if track_id not in self.body_ratio_history:
+                    self.body_ratio_history[track_id] = []
+                self.body_ratio_history[track_id].append(ratios)
         
         # Optionally print skeleton detection stats every 100 frames
         if self.frame_count % 100 == 0 and self.skeleton_total_count > 0:
@@ -582,7 +599,7 @@ class PersonTracker:
 
 def process_video(video_path, output_path, yolo_weights, transreid_weights, 
                  conf_threshold=0.3, reid_threshold=0.7, device=None,
-                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False):
+                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False, mmpose_weights=None, show_window=False):
     """Process a video file for person tracking."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -604,10 +621,10 @@ def process_video(video_path, output_path, yolo_weights, transreid_weights,
     # Initialize tracker with auto device selection
     tracker = PersonTracker(yolo_weights, transreid_weights, device=device,
                            conf_threshold=conf_threshold, reid_threshold=reid_threshold,
-                           appearance_weight=appearance_weight, gait_weight=gait_weight, body_weight=body_weight, color_weight=color_weight, height_weight=height_weight, context_weight=context_weight, debug_visualize=debug_visualize)
+                           appearance_weight=appearance_weight, gait_weight=gait_weight, body_weight=body_weight, color_weight=color_weight, height_weight=height_weight, context_weight=context_weight, debug_visualize=debug_visualize, mmpose_weights=mmpose_weights)
     
     frame_idx = 0
-    while cap.isOpened() and frame_idx < 1000:
+    while cap.isOpened() and frame_idx < 5000:
         ret, frame = cap.read()
         if not ret:
             break
@@ -626,13 +643,15 @@ def process_video(video_path, output_path, yolo_weights, transreid_weights,
         out.write(output_frame)
         
         # Display (optional)
-        cv2.imshow('Person Tracking', output_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        if show_window:
+            cv2.imshow('Person Tracking', output_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
     
     cap.release()
     out.release()
-    cv2.destroyAllWindows()
+    if show_window:
+        cv2.destroyAllWindows()
     
     print(f"Tracking complete. Output saved to {output_path}")
 
@@ -654,9 +673,11 @@ if __name__ == "__main__":
     parser.add_argument('--height_weight', type=float, default=0.1, help='Weight for height similarity')
     parser.add_argument('--context_weight', type=float, default=0.05, help='Weight for context similarity')
     parser.add_argument('--debug_visualize', action='store_true', help='Enable debug visualization of matching scores')
+    parser.add_argument('--mmpose_weights', type=str, default='weights/rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611.pth', help='Path to MMPose weights')
+    parser.add_argument('--show_window', action='store_true', help='Show OpenCV window with imshow (for debugging)')
     
     args = parser.parse_args()
     
     process_video(args.video, args.output, args.yolo_weights, args.transreid_weights,
                  conf_threshold=args.conf, reid_threshold=args.reid_threshold, device=args.device,
-                 appearance_weight=args.appearance_weight, gait_weight=args.gait_weight, body_weight=args.body_weight, color_weight=args.color_weight, height_weight=args.height_weight, context_weight=args.context_weight, debug_visualize=args.debug_visualize)
+                 appearance_weight=args.appearance_weight, gait_weight=args.gait_weight, body_weight=args.body_weight, color_weight=args.color_weight, height_weight=args.height_weight, context_weight=args.context_weight, debug_visualize=args.debug_visualize, mmpose_weights=args.mmpose_weights, show_window=args.show_window)

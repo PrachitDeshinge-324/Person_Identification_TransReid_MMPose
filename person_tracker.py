@@ -37,9 +37,9 @@ class PersonTracker:
         # Enhanced tracking parameters
         self.kalman_trackers = {}  # id -> KalmanBoxTracker
         self.inactive_tracks = {}  # id -> (last_bbox, feature, last_seen_frame, confidence)
-        self.max_age = 30  # Maximum frames to keep inactive tracks
-        self.min_hits = 3  # Minimum hits before track is confirmed
-        self.motion_weight = 0.5  # Weight for motion-based matching
+        self.max_age = 90  # Maximum frames to keep inactive tracks
+        self.min_hits = 5  # Minimum hits before track is confirmed
+        self.motion_weight = 1.0  # Weight for motion-based matching
         self.appearance_weight = appearance_weight
         self.gait_weight = gait_weight
         self.body_weight = body_weight

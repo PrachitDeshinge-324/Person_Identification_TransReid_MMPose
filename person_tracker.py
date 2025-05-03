@@ -7,9 +7,25 @@ warnings.filterwarnings("ignore", category=UserWarning)
 import cv2
 import torch
 import numpy as np
-from models import YOLOv8Tracker, TransReIDModel, get_best_device, KalmanBoxTracker
-from utils import draw_tracking_results, get_unique_color, extract_skeleton_keypoints, compute_body_ratios, compute_gait_features
+import logging
+from models.yolo import YOLOv8Tracker
+from models.device import get_best_device
+from models.kalman import KalmanBoxTracker
+from models.transreid import load_transreid_model
+from utils.visualization import draw_tracking_results, get_unique_color
+from utils.pose import extract_skeleton_keypoints, extract_skeleton_batch, get_pose_model
+from utils.gait import compute_body_ratios, compute_gait_features
 from scipy.spatial.distance import cdist
+
+# initialize root logger: writes to logs/person_tracker.log in logs folder
+logging.basicConfig(
+    level=logging.INFO,
+    filename=os.path.join('logs', 'person_tracker.log'),
+    filemode='a',
+    format='%(asctime)s %(name)s [%(levelname)s] %(message)s'
+)
+
+logger = logging.getLogger(__name__)
 
 class PersonTracker:
     def __init__(self, yolo_weights_path, transreid_weights_path, 
@@ -18,14 +34,14 @@ class PersonTracker:
         """Initialize the person tracker with robust tracking capabilities"""
         # Use the best available device if none specified
         self.device = device if device is not None else get_best_device()
-        print(f"Using device: {self.device}")
+        logger.info("Using device: %s", self.device)
         
         # Initialize YOLOv8 for detection and tracking
         self.yolo_tracker = YOLOv8Tracker(yolo_weights_path, device=self.device, 
                                           conf_threshold=conf_threshold)
         
-        # Initialize TransReID for re-identification
-        self.transreid = TransReIDModel(transreid_weights_path, device=self.device)
+        # Initialize TransReID for re-identification (cached)
+        self.transreid = load_transreid_model(transreid_weights_path, self.device)
         
         # Tracking parameters
         self.next_id = 1
@@ -114,8 +130,8 @@ class PersonTracker:
             # Return as a score between 0 and 1 (0 is perfect match)
             return min(combined_dist, 1.0)
         except (IndexError, TypeError, ValueError) as e:
-            print(f"Error in motion distance calculation: {e}")
-            print(f"bbox1: {bbox1}, bbox2: {bbox2}")
+            logger.error("Error in motion distance calculation: %s", e)
+            logger.error("bbox1: %s, bbox2: %s", bbox1, bbox2)
             return 1.0  # Return maximum distance on error
     
     def _update_feature_history(self, track_id, feature):
@@ -252,9 +268,10 @@ class PersonTracker:
                 best_score = score
                 best_id = id_
         if self.debug_visualize and debug_scores:
-            print("\n[DEBUG] Gallery matching candidates (id, total, app, gait, body, color, height, context):")
+            logger.debug("[DEBUG] Gallery matching candidates (id, total, app, gait, body, color, height, context):")
             for row in sorted(debug_scores, key=lambda x: -x[1])[:5]:
-                print(f"  ID {row[0]}: total={row[1]:.3f} app={row[2]:.2f} gait={row[3]:.2f} body={row[4]:.2f} color={row[5]:.2f} height={row[6]:.2f} ctx={row[7]:.2f}")
+                logger.debug("  ID %d: total=%.3f app=%.2f gait=%.2f body=%.2f color=%.2f height=%.2f ctx=%.2f",
+                             row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7])
         return best_id, best_score
 
     def process_frame(self, frame):
@@ -285,11 +302,11 @@ class PersonTracker:
                     if len(prediction) == 4:
                         predicted_tracks[track_id] = prediction
                     else:
-                        print(f"Warning: Invalid prediction length for track {track_id}: {len(prediction)}")
+                        logger.warning("Invalid prediction length for track %d: %d", track_id, len(prediction))
                 else:
-                    print(f"Warning: Unexpected prediction type for track {track_id}: {type(prediction)}")
+                    logger.warning("Unexpected prediction type for track %d: %s", track_id, type(prediction))
             except Exception as e:
-                print(f"Error predicting track {track_id}: {str(e)}")
+                logger.error("Error predicting track %d: %s", track_id, str(e))
         
         # Current active tracks
         current_tracks = {}
@@ -297,50 +314,50 @@ class PersonTracker:
         # Debug info for visualization
         debug_info = {}
         
+        # --- INSERT BATCH SKELETON CALL HERE ---
+        yolo_results = self.yolo_tracker.process_frame(frame)
+        if not yolo_results or len(yolo_results) == 0:
+            self.tracks = {}
+            self.last_debug_info = {}
+            return {}
+        # collect IDs, bboxes, confidences
+        ids, bboxes, confs = zip(*[(tid, bbox, conf) for tid, bbox, conf in yolo_results])
+        # run one MMPose call for all bboxes
+        keypoints_list = extract_skeleton_batch(frame, list(bboxes),
+                                                weights=self.mmpose_weights,
+                                                device=self.device)
+
+        # build enriched detections
+        detections = []
+        for tid, bbox, conf, keypts in zip(ids, bboxes, confs, keypoints_list):
+            body_ratios = compute_body_ratios(keypts) if keypts else {}
+            person_crop = frame[int(bbox[1]):int(bbox[3]), int(bbox[0]):int(bbox[2])]
+            feature = self.transreid.extract_features(person_crop)
+            color_hist = self._extract_color_histogram(person_crop)
+            height = bbox[3] - bbox[1]
+            debug_lines = []
+            if self.debug_visualize:
+                debug_lines.append(f"Skeleton: {'NO' if not keypts else 'YES'}")
+            debug_info[tid] = debug_lines
+            detections.append((tid, bbox, conf, keypts, body_ratios, feature, color_hist, height, debug_info))
+        
         # Step 1: First associate detections with high confidence tracks based on both motion and appearance
         detections_to_process = []
-        for data in yolo_results:
-            if len(data) == 3:
-                track_id, bbox, conf = data
-            else:  # Backward compatibility
-                track_id, bbox = data
-                conf = 1.0
-                
-            x1, y1, x2, y2 = bbox
+        for data in detections:
+            track_id, bbox, conf, keypoints, body_ratios, feature, color_hist, height, debug_info = data
             
             # Skip tiny detections that are likely false positives
-            w, h = x2 - x1, y2 - y1
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
             if w < 20 or h < 20:
                 continue
-                
-            # Get person crop
-            person_crop = frame[int(y1):int(y2), int(x1):int(x2)]
-            if person_crop.size == 0:
-                continue
-                
-            # Extract skeleton keypoints and body ratios
-            print(f"Processing track {track_id} with bbox {bbox} and confidence {conf:.2f}")
-            # Pass the full 'frame' instead of 'person_crop'
-            keypoints = extract_skeleton_keypoints(frame, bbox=[x1, y1, x2, y2], conf=conf, weights=self.mmpose_weights, device=self.device) 
-            body_ratios = compute_body_ratios(keypoints) if keypoints else {}
             
             # Skeleton detection monitoring
             self.skeleton_total_count += 1
             if not keypoints:
                 self.skeleton_missing_count += 1
             
-            # Extract features
-            feature = self.transreid.extract_features(person_crop)
-            
-            # Extract color histogram and height
-            color_hist = self._extract_color_histogram(person_crop)
-            height = y2 - y1
-            
             # For overlay: show if skeleton is missing
-            debug_lines = []
-            if self.debug_visualize:
-                debug_lines.append(f"Skeleton: {'NO' if not keypoints else 'YES'}")
-            debug_info[track_id] = debug_lines
+            debug_info[track_id] = debug_info[track_id]
             
             # If YOLOv8 returned a valid track_id, use it
             if track_id != -1 and track_id in self.kalman_trackers:
@@ -569,7 +586,10 @@ class PersonTracker:
         # Optionally print skeleton detection stats every 100 frames
         if self.frame_count % 100 == 0 and self.skeleton_total_count > 0:
             miss_rate = 100.0 * self.skeleton_missing_count / self.skeleton_total_count
-            print(f"[Skeleton Stats] Missing: {self.skeleton_missing_count}/{self.skeleton_total_count} ({miss_rate:.1f}%)")
+            logger.info("[Skeleton Stats] Missing: %d/%d (%.1f%%)",
+                        self.skeleton_missing_count,
+                        self.skeleton_total_count,
+                        miss_rate)
         
         # Update tracks
         self.tracks = current_tracks
@@ -577,9 +597,8 @@ class PersonTracker:
         
         # Print tracking stats every 30 frames
         if self.frame_count % 30 == 0:
-            print(f"Frame {self.frame_count}: Tracking {len(current_tracks)} active persons, " + 
-                  f"{len(self.inactive_tracks)} inactive tracks, " +
-                  f"{len(self.kalman_trackers)} total trackers")
+            logger.info("Frame %d: Tracking %d active persons, %d inactive tracks, %d total trackers",
+                        self.frame_count, len(current_tracks), len(self.inactive_tracks), len(self.kalman_trackers))
         
         return current_tracks
     
@@ -603,7 +622,7 @@ def process_video(video_path, output_path, yolo_weights, transreid_weights,
     """Process a video file for person tracking."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"Error: Could not open video file {video_path}")
+        logger.error("Could not open video file %s", video_path)
         return
     
     # Get video properties
@@ -612,7 +631,12 @@ def process_video(video_path, output_path, yolo_weights, transreid_weights,
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    print(f"Video: {width}x{height} at {fps:.2f} FPS, {total_frames} frames")
+    logger.info("Video: %dx%d at %.2f FPS, %d frames", width, height, fps, total_frames)
+    
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
     
     # Initialize video writer
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -631,7 +655,8 @@ def process_video(video_path, output_path, yolo_weights, transreid_weights,
             
         frame_idx += 1
         if frame_idx % 10 == 0:  # Only print every 10 frames to reduce console output
-            print(f"Processing frame {frame_idx}/{total_frames} ({frame_idx/total_frames*100:.1f}%)")
+            logger.debug("Processing frame %d/%d (%.1f%%)",
+                         frame_idx, total_frames, frame_idx/total_frames*100)
         
         # Process frame
         tracks = tracker.process_frame(frame)
@@ -653,7 +678,7 @@ def process_video(video_path, output_path, yolo_weights, transreid_weights,
     if show_window:
         cv2.destroyAllWindows()
     
-    print(f"Tracking complete. Output saved to {output_path}")
+    logger.info("Tracking complete. Output saved to %s", output_path)
 
 if __name__ == "__main__":
     import argparse

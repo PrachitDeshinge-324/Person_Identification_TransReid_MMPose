@@ -21,16 +21,16 @@ fi
 
 # Run the main script with all required arguments
 python person_tracker.py \
-  --video 3c.mp4 \
-  --output output_3c.mp4 \
+  --video input/1c.mp4 \
+  --output output/output_1c1.mp4 \
   --yolo_weights weights/yolov8m.pt \
   --transreid_weights weights/transreid_vitbase.pth \
   --mmpose_weights weights/rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611.pth \
   --conf 0.25 \
   --reid_threshold 0.5 \
   --device mps \
-  --appearance_weight 0.35 \
-  --gait_weight 0.35 \
+  --appearance_weight 0.4 \
+  --gait_weight 0.3 \
   --body_weight 0.1 \
   --color_weight 0.1 \
   --height_weight 0.05 \

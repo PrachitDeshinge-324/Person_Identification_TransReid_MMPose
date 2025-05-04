@@ -12,6 +12,7 @@ from models.yolo import YOLOv8Tracker
 from models.device import get_best_device
 from models.kalman import KalmanBoxTracker
 from models.transreid import load_transreid_model
+from models.bytetrack import ByteTrack
 from utils.visualization import draw_tracking_results, get_unique_color
 from utils.pose import extract_skeleton_keypoints, extract_skeleton_batch, get_pose_model
 from utils.gait import compute_body_ratios, compute_gait_features
@@ -30,7 +31,8 @@ logger = logging.getLogger(__name__)
 class PersonTracker:
     def __init__(self, yolo_weights_path, transreid_weights_path, 
                  device=None, conf_threshold=0.3, reid_threshold=0.7,
-                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False, mmpose_weights=None):
+                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False, mmpose_weights=None,
+                 tracker_type='kalman', realtime=False):
         """Initialize the person tracker with robust tracking capabilities"""
         # Use the best available device if none specified
         self.device = device if device is not None else get_best_device()
@@ -83,6 +85,14 @@ class PersonTracker:
         
         # MMPose weights
         self.mmpose_weights = mmpose_weights
+
+        # Tracker type and real-time mode
+        self.tracker_type = tracker_type
+        self.realtime = realtime
+        if self.tracker_type == 'bytetrack':
+            self.bytetrack = ByteTrack(track_thresh=conf_threshold)
+        else:
+            self.bytetrack = None
     
     def _extract_color_histogram(self, image):
         """Extract a normalized color histogram from the person crop (HSV, 16 bins per channel)."""
@@ -277,9 +287,20 @@ class PersonTracker:
     def process_frame(self, frame):
         """Process a frame with enhanced tracking logic"""
         self.frame_count += 1
+
+        # Real-time mode: optionally skip frames for speed
+        if self.realtime and self.frame_count % 2 == 1:
+            return self.tracks
         
         # Get detections from YOLOv8
         yolo_results = self.yolo_tracker.process_frame(frame)
+
+        # If using ByteTrack, update and get tracks
+        if self.tracker_type == 'bytetrack':
+            dets = [(bbox, conf) for tid, bbox, conf in yolo_results]
+            bytetrack_results = self.bytetrack.update(dets)
+            # Assign new track_ids from ByteTrack
+            yolo_results = [(tid, bbox, conf) for tid, bbox, conf in bytetrack_results]
         
         # Predict new locations of existing tracks
         predicted_tracks = {}
@@ -618,7 +639,7 @@ class PersonTracker:
 
 def process_video(video_path, output_path, yolo_weights, transreid_weights, 
                  conf_threshold=0.3, reid_threshold=0.7, device=None,
-                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False, mmpose_weights=None, show_window=False):
+                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False, mmpose_weights=None, show_window=False, tracker_type='kalman', realtime=False):
     """Process a video file for person tracking."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -645,7 +666,7 @@ def process_video(video_path, output_path, yolo_weights, transreid_weights,
     # Initialize tracker with auto device selection
     tracker = PersonTracker(yolo_weights, transreid_weights, device=device,
                            conf_threshold=conf_threshold, reid_threshold=reid_threshold,
-                           appearance_weight=appearance_weight, gait_weight=gait_weight, body_weight=body_weight, color_weight=color_weight, height_weight=height_weight, context_weight=context_weight, debug_visualize=debug_visualize, mmpose_weights=mmpose_weights)
+                           appearance_weight=appearance_weight, gait_weight=gait_weight, body_weight=body_weight, color_weight=color_weight, height_weight=height_weight, context_weight=context_weight, debug_visualize=debug_visualize, mmpose_weights=mmpose_weights, tracker_type=tracker_type, realtime=realtime)
     
     frame_idx = 0
     while cap.isOpened() and frame_idx < 5000:
@@ -700,9 +721,11 @@ if __name__ == "__main__":
     parser.add_argument('--debug_visualize', action='store_true', help='Enable debug visualization of matching scores')
     parser.add_argument('--mmpose_weights', type=str, default='weights/rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611.pth', help='Path to MMPose weights')
     parser.add_argument('--show_window', action='store_true', help='Show OpenCV window with imshow (for debugging)')
+    parser.add_argument('--tracker', type=str, default='kalman', choices=['kalman', 'bytetrack'], help='Tracking algorithm to use (kalman or bytetrack)')
+    parser.add_argument('--realtime', action='store_true', help='Enable real-time mode with frame skipping')
     
     args = parser.parse_args()
     
     process_video(args.video, args.output, args.yolo_weights, args.transreid_weights,
                  conf_threshold=args.conf, reid_threshold=args.reid_threshold, device=args.device,
-                 appearance_weight=args.appearance_weight, gait_weight=args.gait_weight, body_weight=args.body_weight, color_weight=args.color_weight, height_weight=args.height_weight, context_weight=args.context_weight, debug_visualize=args.debug_visualize, mmpose_weights=args.mmpose_weights, show_window=args.show_window)
+                 appearance_weight=args.appearance_weight, gait_weight=args.gait_weight, body_weight=args.body_weight, color_weight=args.color_weight, height_weight=args.height_weight, context_weight=args.context_weight, debug_visualize=args.debug_visualize, mmpose_weights=args.mmpose_weights, show_window=args.show_window, tracker_type=args.tracker, realtime=args.realtime)

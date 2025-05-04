@@ -21,9 +21,9 @@ fi
 
 # Run the main script with all required arguments
 python person_tracker.py \
-  --video input/1c.mp4 \
-  --output output/output_1c1.mp4 \
-  --yolo_weights weights/yolov8m.pt \
+  --video input/3c.mp4 \
+  --output output/output_3c4.mp4 \
+  --yolo_weights weights/yolo12m.pt \
   --transreid_weights weights/transreid_vitbase.pth \
   --mmpose_weights weights/rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611.pth \
   --conf 0.25 \
@@ -35,5 +35,7 @@ python person_tracker.py \
   --color_weight 0.1 \
   --height_weight 0.05 \
   --context_weight 0.05 \
-  --show_window 
+  --show_window \
+  --tracker bytetrack \
+  --realtime
   # --debug_visualize  # Uncomment to enable debug visualization

@@ -16,3 +16,4 @@ mmpose
 mmcv>=2.0.0rc4,<2.2.0
 mmengine
 torch
+imageio

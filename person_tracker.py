@@ -28,6 +28,42 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+def load_gait_embeddings(gait_feature_dir):
+    """
+    Load gait embeddings for all tracks from OpenGait output directory.
+    Returns: dict {track_id: embedding (np.ndarray)}
+    """
+    embeddings = {}
+    for track_folder in os.listdir(gait_feature_dir):
+        track_path = os.path.join(gait_feature_dir, track_folder)
+        if not os.path.isdir(track_path):
+            continue
+        for root, dirs, files in os.walk(track_path):
+            for file in files:
+                if file.endswith('.npy'):
+                    emb = np.load(os.path.join(root, file))
+                    embeddings[track_folder] = emb
+    return embeddings
+
+
+def track_to_track_gait_matching(gait_feature_dir, threshold=0.7):
+    """
+    Compare gait embeddings for all tracks and print similarity scores.
+    Optionally, flag pairs above a similarity threshold.
+    """
+    embeddings = load_gait_embeddings(gait_feature_dir)
+    track_ids = list(embeddings.keys())
+    for i, tid1 in enumerate(track_ids):
+        for j, tid2 in enumerate(track_ids):
+            if i >= j:
+                continue  # avoid duplicate/self-comparison
+            emb1 = embeddings[tid1]
+            emb2 = embeddings[tid2]
+            sim = 1 - cdist([emb1], [emb2], metric='cosine')[0, 0]
+            print(f"Similarity between {tid1} and {tid2}: {sim:.3f}")
+            if sim > threshold:
+                print(f"  -> Likely same person (sim > {threshold})")
+
 class PersonTracker:
     def __init__(self, yolo_weights_path, transreid_weights_path, 
                  device=None, conf_threshold=0.3, reid_threshold=0.7,

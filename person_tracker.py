@@ -15,8 +15,14 @@ from models.transreid import load_transreid_model
 from models.bytetrack import ByteTrack
 from utils.visualization import draw_tracking_results, get_unique_color
 from utils.pose import extract_skeleton_keypoints, extract_skeleton_batch, get_pose_model
-from utils.gait import compute_body_ratios, compute_gait_features
+from utils.gaits import compute_body_ratios, compute_gait_features
 from scipy.spatial.distance import cdist
+from ultralytics import YOLO
+from utils.gait.gait_infer import OpenGaitEmbedder
+from ultralytics.utils import LOGGER as yolo_logger
+
+# Set Ultralytics logger level to WARNING
+yolo_logger.setLevel(logging.WARNING)
 
 # initialize root logger: writes to logs/person_tracker.log in logs folder
 logging.basicConfig(
@@ -129,6 +135,11 @@ class PersonTracker:
             self.bytetrack = ByteTrack(track_thresh=conf_threshold)
         else:
             self.bytetrack = None
+
+        # YOLOv8-seg and OpenGait integration
+        self.seg_model = YOLO('weights/yolov8x-seg.pt')
+        self.gait_embedder = OpenGaitEmbedder(device=self.device)
+        self.silhouette_history = {}  # track_id -> list of silhouettes
     
     def _extract_color_histogram(self, image):
         """Extract a normalized color histogram from the person crop (HSV, 16 bins per channel)."""
@@ -240,25 +251,46 @@ class PersonTracker:
 
     def _calculate_gait_similarity(self, gait1, gait2, ratios1=None, ratios2=None):
         """
-        Calculate similarity between two gait feature dicts, including body ratios for scale invariance.
+        Calculate similarity between two gait features, combining OpenGait embedding and skeleton gait dict.
+        Always combine both if available.
         """
-        if not gait1 or not gait2:
-            return 0.0
-        gait_keys = set(gait1.keys()) & set(gait2.keys())
-        gait_v1 = np.array([gait1[k] for k in gait_keys])
-        gait_v2 = np.array([gait2[k] for k in gait_keys])
-        gait_dist = np.linalg.norm(gait_v1 - gait_v2) / (np.linalg.norm(gait_v1) + np.linalg.norm(gait_v2) + 1e-6) if gait_keys else 1.0
+        # OpenGait cosine similarity (if both are numpy arrays)
+        cosine_sim = None
+        if isinstance(gait1, np.ndarray) and isinstance(gait2, np.ndarray) and gait1.size > 0 and gait2.size > 0:
+            cosine_sim = 1 - cdist([gait1], [gait2], metric='cosine')[0, 0]
+        else:
+            cosine_sim = 0.0
+
+        # Skeleton gait similarity (if both are dicts)
+        skel_score = 0.0
+        if isinstance(gait1, dict) and isinstance(gait2, dict) and gait1 and gait2:
+            gait_keys = set(gait1.keys()) & set(gait2.keys())
+            gait_v1 = np.array([gait1[k] for k in gait_keys])
+            gait_v2 = np.array([gait2[k] for k in gait_keys])
+            gait_dist = np.linalg.norm(gait_v1 - gait_v2) / (np.linalg.norm(gait_v1) + np.linalg.norm(gait_v2) + 1e-6) if gait_keys else 1.0
+            skel_score = 1.0 - gait_dist
+        # Optionally, combine with body ratios if available
         ratio_score = 0.0
-        if ratios1 and ratios2:
+        if ratios1 and ratios2 and isinstance(ratios1, dict) and isinstance(ratios2, dict):
             ratio_keys = set(ratios1.keys()) & set(ratios2.keys())
             if ratio_keys:
                 r1 = np.array([ratios1[k] for k in ratio_keys])
                 r2 = np.array([ratios2[k] for k in ratio_keys])
                 ratio_dist = np.linalg.norm(r1 - r2) / (np.linalg.norm(r1) + np.linalg.norm(r2) + 1e-6)
                 ratio_score = 1.0 - ratio_dist
-        gait_score = 1.0 - gait_dist
-        # Weighted sum: 70% temporal gait, 30% body ratios
-        return 0.7 * gait_score + 0.3 * ratio_score
+
+        # Print cosine_sim for debug, include track info if available
+        track_info = ""
+        if hasattr(self, "current_track_id_for_gait_sim") and hasattr(self, "current_gallery_track_id_for_gait_sim"):
+            track_info = f" (detection track {self.current_track_id_for_gait_sim} vs gallery track {self.current_gallery_track_id_for_gait_sim})"
+        elif hasattr(self, "current_track_id_for_gait_sim"):
+            track_info = f" (track {self.current_track_id_for_gait_sim})"
+        elif hasattr(self, "current_gallery_track_id_for_gait_sim"):
+            track_info = f" (gallery track {self.current_gallery_track_id_for_gait_sim})"
+        print(f"Frame {getattr(self, 'frame_count', 'N/A')}{track_info} Gait cosine_sim: {cosine_sim:.4f}")
+
+        # Combine: 60% OpenGait, 25% skeleton gait, 15% body ratios
+        return 0.6 * cosine_sim + 0.25 * skel_score + 0.15 * ratio_score
 
     def _update_identity_gallery(self, track_id, color_hist=None, height=None):
         """Update the identity gallery with the latest features for a track."""
@@ -371,6 +403,26 @@ class PersonTracker:
         # Debug info for visualization
         debug_info = {}
         
+        # --- Silhouette extraction using YOLOv8-seg ---
+        seg_results = self.seg_model(frame)
+        seg_masks = {}
+        for r in seg_results:
+            if not hasattr(r, 'masks') or r.masks is None or r.masks.data is None:
+                continue
+            for j, mask in enumerate(r.masks.data):
+                if int(r.boxes.cls[j]) != 0:
+                    continue  # Only person class
+                track_id = int(r.boxes.id[j]) if hasattr(r.boxes, 'id') and r.boxes.id is not None else j
+                sil = (mask.cpu().numpy() > 0.5).astype(np.float32)
+                # Print silhouette info
+                # print(f"Frame {self.frame_count} Silhouette for track {track_id}: shape={sil.shape}")
+                seg_masks[track_id] = sil
+                if track_id not in self.silhouette_history:
+                    self.silhouette_history[track_id] = []
+                self.silhouette_history[track_id].append(sil)
+                if len(self.silhouette_history[track_id]) > 30:
+                    self.silhouette_history[track_id].pop(0)
+        
         # --- INSERT BATCH SKELETON CALL HERE ---
         yolo_results = self.yolo_tracker.process_frame(frame)
         if not yolo_results or len(yolo_results) == 0:
@@ -387,6 +439,9 @@ class PersonTracker:
         # build enriched detections
         detections = []
         for tid, bbox, conf, keypts in zip(ids, bboxes, confs, keypoints_list):
+            # Print silhouette history info for all tracks
+            for track_id, sil_hist in self.silhouette_history.items():
+                print(f"Frame {self.frame_count} Track {track_id} silhouette history length: {len(sil_hist)}")
             body_ratios = compute_body_ratios(keypts) if keypts else {}
             person_crop = frame[int(bbox[1]):int(bbox[3]), int(bbox[0]):int(bbox[2])]
             feature = self.transreid.extract_features(person_crop)
@@ -396,12 +451,28 @@ class PersonTracker:
             if self.debug_visualize:
                 debug_lines.append(f"Skeleton: {'NO' if not keypts else 'YES'}")
             debug_info[tid] = debug_lines
-            detections.append((tid, bbox, conf, keypts, body_ratios, feature, color_hist, height, debug_info))
+            gait_embedding = None
+            detections.append((tid, bbox, conf, keypts, body_ratios, feature, color_hist, height, debug_info, gait_embedding))
+        # After detections, extract gait embeddings for all tracks with enough silhouettes
+        for track_id, sil_hist in self.silhouette_history.items():
+            if len(sil_hist) >= 10:
+                silhouettes = np.stack(sil_hist[-10:], axis=0)
+                gait_embedding = self.gait_embedder.extract(silhouettes)
+                print(
+                    f"Frame {self.frame_count} Gait embedding for track {track_id}: "
+                    f"type={type(gait_embedding)}, shape={getattr(gait_embedding, 'shape', 'N/A')}, "
+                    f"mean={np.mean(gait_embedding):.4f}, min={np.min(gait_embedding):.4f}, max={np.max(gait_embedding):.4f}"
+                )
+                # Store the latest gait embedding for re-identification
+                if gait_embedding is not None:
+                    if track_id not in self.gait_history:
+                        self.gait_history[track_id] = []
+                    self.gait_history[track_id].append(gait_embedding)
         
         # Step 1: First associate detections with high confidence tracks based on both motion and appearance
         detections_to_process = []
         for data in detections:
-            track_id, bbox, conf, keypoints, body_ratios, feature, color_hist, height, debug_info = data
+            track_id, bbox, conf, keypoints, body_ratios, feature, color_hist, height, debug_info, _ = data
             
             # Skip tiny detections that are likely false positives
             w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
@@ -431,14 +502,25 @@ class PersonTracker:
                 self.skeleton_history[track_id].append(keypoints)
                 self.body_ratio_history[track_id].append(body_ratios)
                 
+                # Update gait history with embedding
+                if track_id in self.gait_history and self.gait_history[track_id]:
+                    gait_embedding = self.gait_history[track_id][-1]
+                else:
+                    gait_embedding = None
+                
+                if gait_embedding is not None:
+                    if track_id not in self.gait_history:
+                        self.gait_history[track_id] = []
+                    self.gait_history[track_id].append(gait_embedding)
+                
                 # Update identity gallery
                 self._update_identity_gallery(track_id, color_hist=color_hist, height=height)
             else:
                 # Process later
-                detections_to_process.append((bbox, feature, conf, keypoints, body_ratios, color_hist, height))
+                detections_to_process.append((bbox, feature, conf, keypoints, body_ratios, color_hist, height, gait_embedding))
         
         # Step 2: Associate remaining detections with tracks
-        for bbox, feature, conf, keypoints, body_ratios, color_hist, height in detections_to_process:
+        for bbox, feature, conf, keypoints, body_ratios, color_hist, height, _ in detections_to_process:
             best_match_id = None
             best_match_score = 0
             
@@ -468,8 +550,7 @@ class PersonTracker:
                     if track_id in self.gait_history and self.gait_history[track_id]:
                         prev_gait = self.gait_history[track_id][-1]
                         prev_ratios = self.body_ratio_history[track_id][-1] if track_id in self.body_ratio_history and self.body_ratio_history[track_id] else None
-                        gait, ratios = compute_gait_features(self.skeleton_history[track_id]) if track_id in self.skeleton_history else ({}, {})
-                        gait_score = self._calculate_gait_similarity(gait, prev_gait, body_ratios, prev_ratios)
+                        gait_score = self._calculate_gait_similarity(prev_gait, prev_gait, body_ratios, prev_ratios)
                     
                     # Compare color histograms
                     color_score = 0.0
@@ -512,8 +593,7 @@ class PersonTracker:
                     if track_id in self.gait_history and self.gait_history[track_id]:
                         prev_gait = self.gait_history[track_id][-1]
                         prev_ratios = self.body_ratio_history[track_id][-1] if track_id in self.body_ratio_history and self.body_ratio_history[track_id] else None
-                        gait, ratios = compute_gait_features(self.skeleton_history[track_id]) if track_id in self.skeleton_history else ({}, {})
-                        gait_score = self._calculate_gait_similarity(gait, prev_gait, body_ratios, prev_ratios)
+                        gait_score = self._calculate_gait_similarity(prev_gait, prev_gait, body_ratios, prev_ratios)
                     
                     # Compare color histograms
                     color_score = 0.0
@@ -577,6 +657,17 @@ class PersonTracker:
                 self.skeleton_history[track_id].append(keypoints)
                 self.body_ratio_history[track_id].append(body_ratios)
                 
+                # Update gait history with embedding
+                if track_id in self.gait_history and self.gait_history[track_id]:
+                    gait_embedding = self.gait_history[track_id][-1]
+                else:
+                    gait_embedding = None
+                
+                if gait_embedding is not None:
+                    if track_id not in self.gait_history:
+                        self.gait_history[track_id] = []
+                    self.gait_history[track_id].append(gait_embedding)
+                
                 # Update identity gallery
                 self._update_identity_gallery(track_id, color_hist=color_hist, height=height)
             else:
@@ -596,6 +687,15 @@ class PersonTracker:
                 # Initialize skeleton and body ratio history
                 self.skeleton_history[track_id] = [keypoints]
                 self.body_ratio_history[track_id] = [body_ratios]
+                
+                # Update gait history with embedding
+                if track_id in self.gait_history and self.gait_history[track_id]:
+                    gait_embedding = self.gait_history[track_id][-1]
+                else:
+                    gait_embedding = None
+                
+                if gait_embedding is not None:
+                    self.gait_history[track_id] = [gait_embedding]
                 
                 # Update identity gallery
                 self._update_identity_gallery(track_id, color_hist=color_hist, height=height)

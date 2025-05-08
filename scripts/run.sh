@@ -21,8 +21,8 @@ fi
 
 # Run the main script with all required arguments
 python person_tracker.py \
-  --video input/1c.mp4 \
-  --output output/output_1c0.mp4 \
+  --video input/3c.mp4 \
+  --output output/output_3c0.mp4 \
   --yolo_weights weights/yolo12m.pt \
   --transreid_weights weights/transreid_vitbase.pth \
   --mmpose_weights weights/rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611.pth \

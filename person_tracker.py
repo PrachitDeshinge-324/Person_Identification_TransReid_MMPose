@@ -255,20 +255,24 @@ class PersonTracker:
         Always combine both if available.
         """
         # OpenGait cosine similarity (if both are numpy arrays)
-        cosine_sim = None
+        cosine_sim = 0.0
         if isinstance(gait1, np.ndarray) and isinstance(gait2, np.ndarray) and gait1.size > 0 and gait2.size > 0:
+            # Cosine similarity can be in [-1, 1], but for embeddings it should be [0, 1]
             cosine_sim = 1 - cdist([gait1], [gait2], metric='cosine')[0, 0]
-        else:
-            cosine_sim = 0.0
+            # Clamp to [0, 1] for safety
+            cosine_sim = max(0.0, min(1.0, cosine_sim))
 
         # Skeleton gait similarity (if both are dicts)
         skel_score = 0.0
         if isinstance(gait1, dict) and isinstance(gait2, dict) and gait1 and gait2:
             gait_keys = set(gait1.keys()) & set(gait2.keys())
-            gait_v1 = np.array([gait1[k] for k in gait_keys])
-            gait_v2 = np.array([gait2[k] for k in gait_keys])
-            gait_dist = np.linalg.norm(gait_v1 - gait_v2) / (np.linalg.norm(gait_v1) + np.linalg.norm(gait_v2) + 1e-6) if gait_keys else 1.0
-            skel_score = 1.0 - gait_dist
+            if gait_keys:
+                gait_v1 = np.array([gait1[k] for k in gait_keys])
+                gait_v2 = np.array([gait2[k] for k in gait_keys])
+                gait_dist = np.linalg.norm(gait_v1 - gait_v2) / (np.linalg.norm(gait_v1) + np.linalg.norm(gait_v2) + 1e-6)
+                skel_score = 1.0 - gait_dist
+                skel_score = max(0.0, min(1.0, skel_score))
+
         # Optionally, combine with body ratios if available
         ratio_score = 0.0
         if ratios1 and ratios2 and isinstance(ratios1, dict) and isinstance(ratios2, dict):
@@ -278,6 +282,7 @@ class PersonTracker:
                 r2 = np.array([ratios2[k] for k in ratio_keys])
                 ratio_dist = np.linalg.norm(r1 - r2) / (np.linalg.norm(r1) + np.linalg.norm(r2) + 1e-6)
                 ratio_score = 1.0 - ratio_dist
+                ratio_score = max(0.0, min(1.0, ratio_score))
 
         # Print cosine_sim for debug, include track info if available
         track_info = ""
@@ -287,7 +292,7 @@ class PersonTracker:
             track_info = f" (track {self.current_track_id_for_gait_sim})"
         elif hasattr(self, "current_gallery_track_id_for_gait_sim"):
             track_info = f" (gallery track {self.current_gallery_track_id_for_gait_sim})"
-        print(f"Frame {getattr(self, 'frame_count', 'N/A')}{track_info} Gait cosine_sim: {cosine_sim:.4f}")
+        print(f"Frame {getattr(self, 'frame_count', 'N/A')}{track_info} Gait cosine_sim: {cosine_sim:.4f} skel_score: {skel_score:.4f} ratio_score: {ratio_score:.4f}")
 
         # Combine: 60% OpenGait, 25% skeleton gait, 15% body ratios
         return 0.6 * cosine_sim + 0.25 * skel_score + 0.15 * ratio_score
@@ -313,14 +318,18 @@ class PersonTracker:
     def _match_to_gallery(self, feature, gait, body, color_hist, height, context):
         """Match a new detection to the identity gallery using all cues."""
         best_id = None
-        best_score = 0
+        best_score = float('-inf')  # Allow negative scores for best match
         debug_scores = []
         for id_, entry in self.identity_gallery.items():
+            # Skip comparing to self if possible (i.e., don't compare detection to its own gallery entry)
+            if hasattr(self, "current_track_id_for_gait_sim") and self.current_track_id_for_gait_sim == id_:
+                continue
             score = 0
             # Appearance
             app_score = self._calculate_appearance_similarity(feature, entry['appearance']) if entry['appearance'] is not None and feature is not None else 0.0
             score += self.appearance_weight * app_score
             # Gait
+            self.current_gallery_track_id_for_gait_sim = id_
             gait_score = self._calculate_gait_similarity(gait, entry['gait'], body, entry['body']) if entry['gait'] and gait else 0.0
             score += self.gait_weight * gait_score
             # Body
@@ -342,15 +351,15 @@ class PersonTracker:
                 context_score = max(0, 1 - time_diff / 100)
             score += self.context_weight * context_score
             debug_scores.append((id_, score, app_score, gait_score, body_score, color_score, height_score, context_score))
-            if score > best_score and score > self.reid_threshold:
+            # Only update best_id if score is higher than previous best
+            if score > best_score:
                 best_score = score
                 best_id = id_
-        if self.debug_visualize and debug_scores:
-            logger.debug("[DEBUG] Gallery matching candidates (id, total, app, gait, body, color, height, context):")
-            for row in sorted(debug_scores, key=lambda x: -x[1])[:5]:
-                logger.debug("  ID %d: total=%.3f app=%.2f gait=%.2f body=%.2f color=%.2f height=%.2f ctx=%.2f",
-                             row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7])
-        return best_id, best_score
+        # Optionally, you can still require a minimum threshold for acceptance:
+        if best_score > self.reid_threshold:
+            return best_id, best_score
+        else:
+            return None, best_score
 
     def process_frame(self, frame):
         """Process a frame with enhanced tracking logic"""
@@ -440,8 +449,8 @@ class PersonTracker:
         detections = []
         for tid, bbox, conf, keypts in zip(ids, bboxes, confs, keypoints_list):
             # Print silhouette history info for all tracks
-            for track_id, sil_hist in self.silhouette_history.items():
-                print(f"Frame {self.frame_count} Track {track_id} silhouette history length: {len(sil_hist)}")
+            # for track_id, sil_hist in self.silhouette_history.items():
+            #     print(f"Frame {self.frame_count} Track {track_id} silhouette history length: {len(sil_hist)}")
             body_ratios = compute_body_ratios(keypts) if keypts else {}
             person_crop = frame[int(bbox[1]):int(bbox[3]), int(bbox[0]):int(bbox[2])]
             feature = self.transreid.extract_features(person_crop)
@@ -458,11 +467,11 @@ class PersonTracker:
             if len(sil_hist) >= 10:
                 silhouettes = np.stack(sil_hist[-10:], axis=0)
                 gait_embedding = self.gait_embedder.extract(silhouettes)
-                print(
-                    f"Frame {self.frame_count} Gait embedding for track {track_id}: "
-                    f"type={type(gait_embedding)}, shape={getattr(gait_embedding, 'shape', 'N/A')}, "
-                    f"mean={np.mean(gait_embedding):.4f}, min={np.min(gait_embedding):.4f}, max={np.max(gait_embedding):.4f}"
-                )
+                # print(
+                #     f"Frame {self.frame_count} Gait embedding for track {track_id}: "
+                #     f"type={type(gait_embedding)}, shape={getattr(gait_embedding, 'shape', 'N/A')}, "
+                #     f"mean={np.mean(gait_embedding):.4f}, min={np.min(gait_embedding):.4f}, max={np.max(gait_embedding):.4f}"
+                # )
                 # Store the latest gait embedding for re-identification
                 if gait_embedding is not None:
                     if track_id not in self.gait_history:

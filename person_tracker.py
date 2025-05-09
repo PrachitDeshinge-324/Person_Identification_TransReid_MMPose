@@ -137,7 +137,7 @@ class PersonTracker:
             self.bytetrack = None
 
         # YOLOv8-seg and OpenGait integration
-        self.seg_model = YOLO('weights/yolov8x-seg.pt')
+        self.seg_model = YOLO('weights/yolo11x-seg.pt')
         self.gait_embedder = OpenGaitEmbedder(device=self.device)
         self.silhouette_history = {}  # track_id -> list of silhouettes
     
@@ -464,18 +464,14 @@ class PersonTracker:
         # After detections, extract gait embeddings for all tracks with enough silhouettes
         for track_id, sil_hist in self.silhouette_history.items():
             if len(sil_hist) >= 10:
-                silhouettes = np.stack(sil_hist[-10:], axis=0)
-                gait_embedding = self.gait_embedder.extract(silhouettes)
-                # print(
-                #     f"Frame {self.frame_count} Gait embedding for track {track_id}: "
-                #     f"type={type(gait_embedding)}, shape={getattr(gait_embedding, 'shape', 'N/A')}, "
-                #     f"mean={np.mean(gait_embedding):.4f}, min={np.min(gait_embedding):.4f}, max={np.max(gait_embedding):.4f}"
-                # )
-                # Store the latest gait embedding for re-identification
-                if gait_embedding is not None:
+                try:
+                    silhouettes = np.stack(sil_hist[-10:], axis=0)
+                    gait_embedding = self.gait_embedder.extract(silhouettes)
                     if track_id not in self.gait_history:
                         self.gait_history[track_id] = []
                     self.gait_history[track_id].append(gait_embedding)
+                except Exception as e:
+                    logger.warning(f"OpenGait embedding extraction failed for track {track_id}: {e}")
         
         # Step 1: First associate detections with high confidence tracks based on both motion and appearance
         detections_to_process = []

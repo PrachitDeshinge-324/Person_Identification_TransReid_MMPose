@@ -13,7 +13,7 @@ scipy>=1.7.0
 
 # Add MMPose and MMEngine dependencies
 mmpose
-mmcv>=2.0.0rc4,<2.2.0
+mmcv>="2.0.0rc4,<2.2.0"
 mmengine
 torch
 imageio

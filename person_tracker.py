@@ -292,7 +292,7 @@ class PersonTracker:
             track_info = f" (track {self.current_track_id_for_gait_sim})"
         elif hasattr(self, "current_gallery_track_id_for_gait_sim"):
             track_info = f" (gallery track {self.current_gallery_track_id_for_gait_sim})"
-        print(f"Frame {getattr(self, 'frame_count', 'N/A')}{track_info} Gait cosine_sim: {cosine_sim:.4f} skel_score: {skel_score:.4f} ratio_score: {ratio_score:.4f}")
+        # print(f"Frame {getattr(self, 'frame_count', 'N/A')}{track_info} Gait cosine_sim: {cosine_sim:.4f} skel_score: {skel_score:.4f} ratio_score: {ratio_score:.4f}")
 
         # Combine: 60% OpenGait, 25% skeleton gait, 15% body ratios
         return 0.6 * cosine_sim + 0.25 * skel_score + 0.15 * ratio_score
@@ -330,10 +330,10 @@ class PersonTracker:
             score += self.appearance_weight * app_score
             # Gait
             self.current_gallery_track_id_for_gait_sim = id_
-            gait_score = self._calculate_gait_similarity(gait, entry['gait'], body, entry['body']) if entry['gait'] and gait else 0.0
+            gait_score = self._calculate_gait_similarity(gait, entry['gait'], body, entry['body']) if entry['gait'] is not None and gait is not None else 0.0
             score += self.gait_weight * gait_score
             # Body
-            body_score = self._calculate_body_similarity(body, entry['body']) if entry['body'] and body else 0.0
+            body_score = self._calculate_body_similarity(body, entry['body']) if entry['body'] is not None and body is not None else 0.0
             score += self.body_weight * body_score
             # Color histogram
             color_score = self._compare_histograms(color_hist, entry['color_hist']) if entry.get('color_hist') is not None and color_hist is not None else 0.0
@@ -355,11 +355,10 @@ class PersonTracker:
             if score > best_score:
                 best_score = score
                 best_id = id_
-        # Optionally, you can still require a minimum threshold for acceptance:
-        if best_score > self.reid_threshold:
-            return best_id, best_score
-        else:
-            return None, best_score
+        debug_scores_sorted = sorted(debug_scores, key=lambda x: x[1], reverse=True)
+        best_id, best_score = (debug_scores_sorted[0][0], debug_scores_sorted[0][1]) if debug_scores_sorted else (None, None)
+        second_id, second_score = (debug_scores_sorted[1][0], debug_scores_sorted[1][1]) if len(debug_scores_sorted) > 1 else (None, None)
+        return best_id, best_score, second_id, second_score
 
     def process_frame(self, frame):
         """Process a frame with enhanced tracking logic"""

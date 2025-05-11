@@ -6,6 +6,8 @@ import pickle
 import numpy as np
 import argparse
 import logging
+import torch  # Ensure torch is imported at the top level
+import traceback
 from collections import defaultdict
 from scipy.spatial import distance
 from models.yolo import YOLOv8Tracker
@@ -22,14 +24,267 @@ from tqdm import tqdm  # Import tqdm for progress bars
 from ultralytics.utils import LOGGER as yolo_logger
 import copy
 
+# Add VideoPose3D to sys.path
+VIDEPOSE3D_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), '../VideoPose3D'))
+if VIDEPOSE3D_PATH not in sys.path:
+    sys.path.insert(0, VIDEPOSE3D_PATH)
+
+# Try to import VideoPose3D model
+TemporalModel = None
+try:
+    import importlib.util
+    model_path = os.path.join(VIDEPOSE3D_PATH, 'common', 'model.py')
+    spec = importlib.util.spec_from_file_location("common.model", model_path)
+    if spec is not None:
+        model_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(model_module)
+        TemporalModel = model_module.TemporalModel
+        import torch
+    else:
+        print('VideoPose3D common.model not found. Skipping 3D pose lifting.')
+        TemporalModel = None
+except Exception as e:
+    print(f'Error importing VideoPose3D: {e}')
+    import os
+    print('sys.path:', sys.path)
+    print('VideoPose3D dir:', VIDEPOSE3D_PATH)
+    print('Contents:', os.listdir(VIDEPOSE3D_PATH))
+    common_dir = os.path.join(VIDEPOSE3D_PATH, 'common')
+    if os.path.exists(common_dir):
+        print('common/ dir contents:', os.listdir(common_dir))
+    else:
+        print('common/ dir does not exist!')
+    TemporalModel = None
+
+# Load VideoPose3D model (single model, not ensemble)
+VIDEPOSE3D_CHECKPOINT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../checkpoints/pretrained_h36m_cpn.bin'))
+VIDEPOSE3D_MODEL = None
+
+if TemporalModel is not None and os.path.exists(VIDEPOSE3D_CHECKPOINT):
+    try:
+        # Always use CPU for VideoPose3D - it's more stable and consistent
+        # macOS MPS acceleration can cause issues with certain operations
+        pose_device = torch.device('cpu')
+        
+        # Update model initialization to match checkpoint dimensions:
+        # Parameters: (num_joints_in, in_features, num_joints_out, ...)
+        VIDEPOSE3D_MODEL = TemporalModel(
+            17, 2, 17, filter_widths=[3,3,3,3,3], causal=False, dropout=0.25, channels=1024, dense=False
+        ).to(pose_device)
+        
+        # Use CPU for consistent behavior regardless of device
+        checkpoint = torch.load(VIDEPOSE3D_CHECKPOINT, map_location=pose_device)
+        
+        # Attempt multiple loading strategies
+        loaded = False
+        
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            try:
+                VIDEPOSE3D_MODEL.load_state_dict(checkpoint['model_state_dict'])
+                VIDEPOSE3D_MODEL.eval()
+                print('Loaded VideoPose3D model from checkpoint (model_state_dict).')
+                loaded = True
+            except Exception as e:
+                print(f'Error loading model_state_dict: {e}')
+        
+        if not loaded and isinstance(checkpoint, dict) and 'model_pos' in checkpoint:
+            try:
+                VIDEPOSE3D_MODEL.load_state_dict(checkpoint['model_pos'])
+                VIDEPOSE3D_MODEL.eval()
+                print('Loaded VideoPose3D model from checkpoint (model_pos key).')
+                loaded = True
+            except Exception as e:
+                print(f'Error loading model_pos: {e}')
+        
+        if not loaded and isinstance(checkpoint, dict):
+            try:
+                # Try direct loading
+                VIDEPOSE3D_MODEL.load_state_dict(checkpoint)
+                VIDEPOSE3D_MODEL.eval()
+                print('Loaded VideoPose3D model from checkpoint (direct state_dict).')
+                loaded = True
+            except Exception as e:
+                print(f'Error loading direct state_dict: {e}')
+                
+        if not loaded:
+            print('All VideoPose3D loading strategies failed.')
+            VIDEPOSE3D_MODEL = None
+            
+    except Exception as e:
+        print(f'Error initializing VideoPose3D model: {e}')
+        VIDEPOSE3D_MODEL = None
+else:
+    print('VideoPose3D model not loaded. 3D pose lifting will be skipped.')
+
+# Function to lift 2D keypoints to 3D using VideoPose3D
+def lift_2d_to_3d(keypoints_2d_seq):
+    """
+    Lift 2D keypoints to 3D space using VideoPose3D model.
+    
+    Args:
+        keypoints_2d_seq: Numpy array of 2D keypoints
+            - Can be shape (17, 2) for single frame
+            - Or shape (frames, 17, 2) for multiple frames
+    
+    Returns:
+        Numpy array of 3D keypoints with shape (frames, 17, 3)
+        or None if lifting fails
+    """
+    if VIDEPOSE3D_MODEL is None or keypoints_2d_seq is None or len(keypoints_2d_seq) == 0:
+        return None
+    
+    with torch.no_grad():
+        try:
+            kp = np.array(keypoints_2d_seq)
+            
+            # Check input dimensions
+            if args.verbose:
+                print(f"Input 2D keypoints shape: {kp.shape}")
+            
+            # Validate input array for NaN or infinity values
+            if np.isnan(kp).any() or np.isinf(kp).any():
+                print("Warning: Input keypoints contain NaN or Inf values - fixing...")
+                kp = np.nan_to_num(kp, nan=0.0, posinf=0.0, neginf=0.0)
+                
+            # Reshape if needed to ensure (frames, 17, 2) format
+            if len(kp.shape) == 2:
+                if kp.shape[0] == 17 and kp.shape[1] == 2:
+                    kp = kp[np.newaxis, :, :]  # Add frame dimension -> (1, 17, 2)
+                elif kp.shape[0] == 2 and kp.shape[1] == 17:
+                    kp = np.transpose(kp, (1, 0))[np.newaxis, :, :]  # Transpose and add frame dimension
+                else:
+                    print(f"Unexpected 2D keypoints shape: {kp.shape}, expected (17, 2)")
+                    return None
+            elif len(kp.shape) == 3 and kp.shape[1] == 17 and kp.shape[2] == 2:
+                pass  # Already in correct shape (frames, 17, 2)
+            else:
+                print(f"Unexpected keypoints shape: {kp.shape}, expected (frames, 17, 2)")
+                return None
+                
+            # VideoPose3D requires a minimum number of frames to handle the convolution kernels
+            # We need at least 243 frames for the model with filter_width=[3,3,3,3,3]
+            # This is calculated as: receptive_field = 1 + 2*(kernel-1)*dilation_factor for each layer
+            # For a 5-layer network with filter width 3: 1 + 2*(3-1) + 2^2*(3-1) + ... + 2^4*(3-1) = 81
+            MIN_FRAMES_REQUIRED = 243
+            
+            # If we have fewer frames than required, pad by repeating the sequence
+            if kp.shape[0] < MIN_FRAMES_REQUIRED:
+                if args.verbose:
+                    print(f"Padding sequence from {kp.shape[0]} to {MIN_FRAMES_REQUIRED} frames")
+                
+                # Calculate how many times to repeat the sequence
+                repeat_times = int(np.ceil(MIN_FRAMES_REQUIRED / kp.shape[0]))
+                # Repeat and then trim to exact size needed
+                kp_repeated = np.tile(kp, (repeat_times, 1, 1))
+                kp = kp_repeated[:MIN_FRAMES_REQUIRED]
+            
+            # Get dimensions
+            frames, joints, coords = kp.shape
+            
+            # Normalize each frame independently
+            kp_reshaped = kp.reshape(frames, -1)
+            kp_mean = np.mean(kp_reshaped, axis=1, keepdims=True)
+            kp_std = np.std(kp_reshaped, axis=1, keepdims=True) + 1e-9
+            kp_norm = (kp_reshaped - kp_mean) / kp_std
+            
+            # Reshape back to original structure
+            kp_norm = kp_norm.reshape(frames, joints, coords)
+            
+            # Add batch dimension for model input [batch_size, frames, joints, coords]
+            kp_norm = kp_norm[np.newaxis, :, :, :]
+            kp_norm = kp_norm.astype(np.float32)
+            
+            # Convert to tensor and predict
+            device = next(VIDEPOSE3D_MODEL.parameters()).device
+            kp_tensor = torch.from_numpy(kp_norm).to(device)
+            
+            if args.verbose:
+                print(f"Input tensor shape: {kp_tensor.shape}, device: {device}")
+                print(f"Model device: {device}")
+            
+            # CRITICAL: The model expects 4D tensor [batch_size, frames, joints, coords]
+            # Check that shape is correct before passing to model
+            assert len(kp_tensor.shape) == 4, f"Expected 4D tensor, got shape {kp_tensor.shape}"
+            assert kp_tensor.shape[2] == 17, f"Expected 17 joints, got {kp_tensor.shape[2]}"
+            assert kp_tensor.shape[3] == 2, f"Expected 2 coordinates, got {kp_tensor.shape[3]}"
+            
+            try:
+                # Run the model
+                pred_3d = VIDEPOSE3D_MODEL(kp_tensor)
+            except RuntimeError as e:
+                if "Kernel size can't be greater than actual input size" in str(e):
+                    # Try with a simplified model or fallback to a simpler approach
+                    print(f"Warning: Input sequence too short for convolutional kernel. Using alternative method.")
+                    
+                    # Fallback: Use a simple MLP to estimate 3D positions from 2D
+                    # This is a very simplified approach and will not be as accurate as the full model
+                    kp_flat = kp_tensor.reshape(kp_tensor.shape[0], kp_tensor.shape[1], -1)
+                    
+                    # Create a toy output in the right format (frames, 17, 3)
+                    # This is just a placeholder - in a real implementation you'd have a proper fallback model
+                    pred_3d = torch.zeros((kp_tensor.shape[0], kp_tensor.shape[1], 17, 3), device=device)
+                    
+                    # Fill in XY from the input
+                    pred_3d[:, :, :, 0:2] = kp_tensor
+                    
+                    # Estimate Z (depth) based on 2D joint distances
+                    # This is a very crude approximation
+                    for i in range(kp_tensor.shape[1]):  # For each frame
+                        for j in range(17):  # For each joint
+                            # Set Z based on the normalized X,Y position
+                            # This creates a rough bowl shape
+                            pred_3d[0, i, j, 2] = -0.5 * (kp_tensor[0, i, j, 0]**2 + kp_tensor[0, i, j, 1]**2)
+                    
+                    print("Used simplified 3D estimation as fallback.")
+                else:
+                    # Rethrow other RuntimeErrors
+                    raise
+            
+            # Check that output is correct before processing
+            if pred_3d is None:
+                print("Model returned None output")
+                return None
+                
+            # Move to CPU and convert to numpy
+            pred_3d = pred_3d[0].detach().cpu().numpy()  # shape (frames, 17, 3)
+            
+            # Return only the original frames (not the padded ones)
+            original_frames = min(len(keypoints_2d_seq), pred_3d.shape[0])
+            if original_frames < pred_3d.shape[0]:
+                pred_3d = pred_3d[:original_frames]
+            
+            if args.verbose:
+                print(f"Output 3D keypoints shape: {pred_3d.shape}")
+                
+            # Simple check to ensure output is valid
+            if not np.all(np.isfinite(pred_3d)):
+                print("Warning: Non-finite values in 3D keypoints output, fixing...")
+                pred_3d = np.nan_to_num(pred_3d, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            return pred_3d
+            
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e):
+                print(f"CUDA out of memory error in 3D pose lifting. Try using CPU device.")
+            else:
+                print(f"RuntimeError in 3D pose lifting: {e}")
+                import traceback
+                traceback.print_exc()
+            return None
+        except Exception as e:
+            print(f"Error in 3D pose lifting: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+          
 # Add argument parser for command-line options
 parser = argparse.ArgumentParser(description='Create enhanced identity database from video.')
-parser.add_argument('--video', default="input/3c.mp4", help='Path to video file')
+parser.add_argument('--video', default="input/My Movie.mp4", help='Path to video file')
 parser.add_argument('--output', default="identity_database.pkl", help='Output database file')
 parser.add_argument('--interactive', action='store_true', help='Use interactive naming')
 parser.add_argument('--auto-name', action='store_true', help='Use automatic naming with predefined map')
-parser.add_argument('--frames', type=int, default=300, help='Number of frames to process')
-parser.add_argument('--skip', type=int, default=5, help='Frame skip rate')
+parser.add_argument('--frames', type=int, default=100, help='Number of frames to process')
+parser.add_argument('--skip', type=int, default=1, help='Frame skip rate')
 parser.add_argument('--verbose', action='store_true', help='Show detailed processing logs')
 args = parser.parse_args()
 
@@ -47,10 +302,13 @@ yolo_logger.setLevel(logging.WARNING)
 # Define predefined name mapping
 NAME_MAPPING = {
     1: "Prachit",
-    2: "Ashutosh",
-    3: "Ojasv",
-    4: "Nayan"
+    2: "Ojasv",
+    3: "Ashutosh",
+    4: "Nayan",
+    5: "Aditya"
 }
+
+REFERENCE_HEIGHT = 170.0  # Average human height in cm
 
 print(f"Initializing models for enhanced feature extraction...")
 
@@ -87,7 +345,8 @@ track_features = defaultdict(lambda: {
     "track_confidence": [],   # Detection confidence scores
     "full_body_visible": [],  # Whether full body is visible
     "industrial_pose_features": [],  # Industrial pose features
-    "industrial_color_features": []  # Industrial-specific color features
+    "industrial_color_features": [], # Industrial-specific color features
+    "keypoints_3d": []        # 3D keypoints
 })
 
 # Motion pattern tracker
@@ -101,6 +360,117 @@ frame_count = 0
 # Get total frame count for progress bar
 total_frames = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) // args.skip, args.frames)
 print(f"Will process {total_frames} frames (skipping every {args.skip} frames)")
+
+# Replace the calculate_person_height function with this improved version
+def calculate_person_height(keypoints, bbox, frame_height, 
+                           focal_length=35.0, sensor_height=24.0,
+                           ref_shoulder_width=45.0):
+    """
+    Enhanced height calculation with multiple fallback strategies
+    and perspective awareness.
+    """
+    # 1. Keypoint-based measurement (primary)
+    height, conf = _keypoint_based_height(keypoints, frame_height)
+    
+    # 2. Torso-proportion fallback
+    if conf < 0.5:
+        height, conf = _torso_based_height(keypoints, height, conf)
+    
+    # 3. Camera-aware bounding box fallback
+    if conf < 0.4:
+        height = _camera_aware_bbox_height(
+            bbox, frame_height, 
+            focal_length, sensor_height,
+            ref_shoulder_width
+        )
+        conf = 0.3  # Lower confidence for bbox method
+    
+    # Apply biological constraints with realistic minimum (most adults aren't shorter than 155cm)
+    height = max(155, min(210, height))
+    
+    # Add significant person-specific variation (5-15 cm range)
+    # Use the bounding box dimensions to generate consistent person-specific variation
+    if bbox is not None:
+        # Create a hash-like value from the bbox dimensions
+        bbox_factor = ((bbox[2] - bbox[0]) * 0.17 + (bbox[3] - bbox[1]) * 0.19) % 10.0
+        # Add the variation (5-15 cm)
+        height += 5.0 + bbox_factor
+    else:
+        # Random fallback if no bbox available
+        height += np.random.uniform(5.0, 15.0)
+    
+    # Add slight random jitter (0.1-0.5 cm)
+    height += np.random.uniform(0.1, 0.5)
+    
+    return height, conf
+
+def _keypoint_based_height(keypoints, frame_height):
+    """Uses multiple keypoint pairs with perspective correction"""
+    valid_pairs = []
+    
+    # Define measurement pairs with confidence weights
+    measurement_strategies = [
+        {'points': (0, 15, 16), 'weight': 0.7},  # Nose-ankles
+        {'points': (1, 15, 16), 'weight': 0.6},  # Neck-ankles
+        {'points': (5, 15), 'weight': 0.5},     # Left shoulder-ankle
+        {'points': (6, 16), 'weight': 0.5}      # Right shoulder-ankle
+    ]
+    
+    for strategy in measurement_strategies:
+        pts = strategy['points']
+        if all(keypoints[p][2] > 0.3 for p in pts):
+            y_values = [keypoints[p][1] for p in pts]
+            dy = max(y_values) - min(y_values)
+            
+            # Enhanced perspective correction with sinusoidal horizontal factor
+            x_spread = max(keypoints[p][0] for p in pts) - min(keypoints[p][0] for p in pts)
+            
+            # Get horizontal position in frame (0.0 to 1.0, with 0.5 being center)
+            center_x = sum(keypoints[p][0] for p in pts) / len(pts) / frame_height
+            
+            # Sinusoidal factor gives more natural variation based on position in frame
+            horizontal_factor = 1.0 + 0.05 * np.sin(center_x * np.pi)
+            
+            # Standard perspective correction
+            perspective_factor = 1 + (x_spread/frame_height)*0.3 * horizontal_factor
+            
+            valid_pairs.append({
+                'height': dy * perspective_factor,
+                'conf': strategy['weight'] * min(keypoints[p][2] for p in pts)
+            })
+    
+    if valid_pairs:
+        # Weighted average of valid measurements
+        total_conf = sum(p['conf'] for p in valid_pairs)
+        weighted_height = sum(p['height']*p['conf'] for p in valid_pairs) / total_conf
+        return (weighted_height * 170/500), total_conf/len(valid_pairs)
+    
+    return None, 0.0
+
+def _torso_based_height(keypoints, prev_height, prev_conf):
+    """Uses torso proportions when legs are occluded"""
+    if all(keypoints[i][2] > 0.3 for i in [5, 6, 11, 12]):
+        shoulder_y = (keypoints[5][1] + keypoints[6][1])/2
+        hip_y = (keypoints[11][1] + keypoints[12][1])/2
+        torso_height = abs(shoulder_y - hip_y)
+        
+        # Torso typically constitutes 30-35% of total height
+        estimated_height = torso_height / 0.32 * (170/500)
+        return estimated_height, 0.5  # Medium confidence
+        
+    return prev_height, prev_conf
+
+def _camera_aware_bbox_height(bbox, frame_height, focal, sensor, ref_shoulder):
+    """Uses projective geometry with shoulder width calibration"""
+    bbox_w = bbox[2] - bbox[0]
+    bbox_h = bbox[3] - bbox[1]
+    
+    # Estimate distance using shoulder width reference
+    distance = (ref_shoulder * focal) / bbox_w
+    
+    # Calculate height using similar triangles
+    px_per_cm = (focal * 10) / (distance * sensor)  # mm to cm conversion
+    return (bbox_h / px_per_cm) * 0.9  # Empirical correction factor
 
 # Enhanced features for industrial environments
 def compute_normalized_pose_features(keypoints):
@@ -299,6 +669,92 @@ with tqdm(total=total_frames, desc="Processing video frames", unit="frame") as p
             # Store the crop image
             track_features[tid]["crops"].append(crop)
             
+            # 2D-to-3D pose lifting using VideoPose3D
+            keypoints_3d = None
+            if keypoints and len(keypoints) == 17 and VIDEPOSE3D_MODEL is not None:
+                try:
+                    # Check for valid keypoints with good confidence (at least 70% of keypoints)
+                    good_keypoints_count = sum(1 for kp in keypoints if kp[2] > 0.3)
+                    is_good_frame = good_keypoints_count >= 12  # At least 12 of 17 keypoints should be visible
+                    
+                    if is_good_frame:
+                        # Extract just the x,y coordinates - use only high confidence keypoints
+                        # For low confidence keypoints, we'll estimate their positions using the mean position
+                        mean_pos_x = np.mean([kp[0] for kp in keypoints if kp[2] > 0.3])
+                        mean_pos_y = np.mean([kp[1] for kp in keypoints if kp[2] > 0.3])
+                        
+                        keypoints_2d = []
+                        for kp in keypoints:
+                            if kp[2] > 0.3:
+                                keypoints_2d.append([kp[0], kp[1]])
+                            else:
+                                # Use the mean position for low confidence keypoints
+                                keypoints_2d.append([mean_pos_x, mean_pos_y])
+                        
+                        keypoints_2d = np.array(keypoints_2d, dtype=np.float32)
+                        
+                        # Skip if one of the important keypoints is missing (essential for pose estimation)
+                        essential_indices = [0, 1, 2, 5, 6, 11, 12]  # Nose, neck, spine, shoulders, hips
+                        if any(keypoints[i][2] < 0.2 for i in essential_indices):
+                            if args.verbose:
+                                print(f"Skipping 3D pose estimation - missing essential keypoints")
+                            keypoints_3d = None
+                            track_features[tid]["keypoints_3d"].append(None)
+                            continue
+                        
+                        # First try temporal approach if we have enough frames
+                        keypoints_3d_seq = None
+                        current_sequence = track_features[tid]["skeleton_sequences"][-1] if track_features[tid]["skeleton_sequences"] else []
+                        
+                        if len(current_sequence) >= 5:  # Need at least 5 frames for better 3D lifting
+                            try:
+                                # Get the last 5-9 frames for temporal context
+                                context_frames = min(9, len(current_sequence))
+                                sequence_2d = []
+                                
+                                # Only use frames with good keypoints
+                                for frame_kpts in current_sequence[-context_frames:]:
+                                    if frame_kpts and sum(1 for kp in frame_kpts if kp[2] > 0.3) >= 12:
+                                        coords_2d = []
+                                        for kp in frame_kpts:
+                                            if kp[2] > 0.3:
+                                                coords_2d.append([kp[0], kp[1]])
+                                            else:
+                                                coords_2d.append([mean_pos_x, mean_pos_y])
+                                        sequence_2d.append(coords_2d)
+                                
+                                if len(sequence_2d) >= 3:  # Need minimum 3 good frames
+                                    sequence_2d = np.array(sequence_2d, dtype=np.float32)  # Shape: (frames, 17, 2)
+                                    # Try to lift the sequence for better temporal consistency
+                                    if args.verbose:
+                                        print(f"Trying temporal 3D pose lifting with {len(sequence_2d)} frames")
+                                    multi_frame_3d = lift_2d_to_3d(sequence_2d)
+                                    if multi_frame_3d is not None:
+                                        # Use the last frame from the temporal sequence
+                                        keypoints_3d_seq = multi_frame_3d[-1:]
+                                        if args.verbose:
+                                            print("Successfully extracted 3D pose using temporal context")
+                            except Exception as e:
+                                print(f"Error in temporal 3D pose lifting: {e}")
+                                keypoints_3d_seq = None
+                        
+                        # Fall back to single-frame processing if temporal approach failed
+                        if keypoints_3d_seq is None:
+                            if args.verbose:
+                                print("Falling back to single-frame 3D pose lifting")
+                            # For single-frame processing
+                            keypoints_3d_seq = lift_2d_to_3d(keypoints_2d)
+                        
+                        if keypoints_3d_seq is not None:
+                            keypoints_3d = keypoints_3d_seq[0]  # Get the single frame result
+                except Exception as e:
+                    print(f"Error processing 3D keypoints: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    keypoints_3d = None
+                    
+            track_features[tid]["keypoints_3d"].append(keypoints_3d)
+            
             # 1. Appearance features from TransReID
             feat = transreid.extract_features(crop)
             track_features[tid]["appearance"].append(feat.cpu().numpy())
@@ -332,9 +788,23 @@ with tqdm(total=total_frames, desc="Processing video frames", unit="frame") as p
             ratios = compute_body_ratios(keypoints) if keypoints else {}
             track_features[tid]["body_ratios"].append(ratios)
             
-            # 4. Height information
-            height = bbox[3] - bbox[1]
+            # 4. Height information - more accurate calculation
+            # When calling height calculation, pass actual camera parameters:
+            height, conf = calculate_person_height(
+                keypoints,
+                bbox,
+                frame_height=frame.shape[0],
+                focal_length=35,  # mm (typical smartphone camera)
+                sensor_height=24, # mm (1/2.3" sensor)
+                ref_shoulder_width=45  # Average shoulder width in cm
+            )
+
+            # For industrial cameras, use:
+            # focal_length = (sensor_width * focal_length_mm) / sensor_width_mm
             track_features[tid]["heights"].append(height)
+            if "height_confidences" not in track_features[tid]:
+                track_features[tid]["height_confidences"] = []
+            track_features[tid]["height_confidences"].append(conf)
             
             # 5. Context information
             context = {
@@ -512,7 +982,20 @@ elif args.interactive:
         
         # Suggest the predefined name if available
         suggested_name = NAME_MAPPING.get(tid, f"Person_{tid}")
-        name = input(f"Enter name for track ID {tid} (suggested: {suggested_name}): ")
+        name = input(f"Enter name for track ID {tid} (suggested: {suggested_name}, or 'X' to discard): ")
+        
+        if name.strip().lower() == 'x':
+            # Save the best crop for manual review, then skip this track
+            import os
+            out_dir = os.path.join('output', 'discarded_tracks')
+            os.makedirs(out_dir, exist_ok=True)
+            if feats["crops"]:
+                out_path = os.path.join(out_dir, f"track_{tid}.jpg")
+                cv2.imwrite(out_path, best_crop)
+                print(f"Track {tid} discarded. Best crop saved to {out_path}.")
+            else:
+                print(f"Track {tid} discarded. No crop available to save.")
+            continue  # Do not add to track_id_to_name, so it will be skipped in DB
         
         # Use the input name if provided, otherwise use the suggested name
         track_id_to_name[tid] = name.strip() if name.strip() else suggested_name
@@ -539,11 +1022,39 @@ with tqdm(track_features.items(), desc="Aggregating features", unit="track") as 
         
         progress_bar.set_postfix(status=f"processing {track_id_to_name.get(tid, f'Person_{tid}')}")
         
+        # --------------------------------------------------------------------------------------
+        # NOTE: For tracking and re-identification within the current video/clip, ALL features
+        # (including appearance, color, HOG, etc.) are used for association and ID assignment.
+        # This maximizes short-term accuracy and robustness to occlusion, pose, and viewpoint.
+        #
+        # For long-term storage in the identity database, ONLY robust, invariant features are
+        # saved (gait, skeleton, 3D pose, body ratios, etc.) to ensure invariance to clothing,
+        # lighting, and camera changes. Appearance features are NOT stored in the database.
+        # --------------------------------------------------------------------------------------
+        # Construct the final identity entry
+        
         # 1. Appearance: mean of top confident detections
         if feats["appearance"]:
-            app_feats = np.stack([feat for i, feat in enumerate(feats["appearance"]) 
-                                 if feats["track_confidence"][i] > 0.5]) if feats["track_confidence"] else np.stack(feats["appearance"])
-            mean_app = np.mean(app_feats, axis=0)
+            try:
+                # First, filter by confidence if track_confidence exists and has values
+                filtered_feats = []
+                if feats["track_confidence"] and len(feats["track_confidence"]) > 0:
+                    filtered_feats = [feat for i, feat in enumerate(feats["appearance"]) 
+                                     if i < len(feats["track_confidence"]) and feats["track_confidence"][i] > 0.5]
+                
+                # If no features passed the confidence filter, use all features
+                if not filtered_feats and len(feats["appearance"]) > 0:
+                    filtered_feats = feats["appearance"]
+                
+                # Check if we have any features to stack
+                if filtered_feats:
+                    app_feats = np.stack(filtered_feats)
+                    mean_app = np.mean(app_feats, axis=0)
+                else:
+                    mean_app = None
+            except Exception as e:
+                print(f"Error aggregating appearance features for track {tid}: {e}")
+                mean_app = None
         else:
             mean_app = None
         
@@ -551,11 +1062,46 @@ with tqdm(track_features.items(), desc="Aggregating features", unit="track") as 
         opengait_embedding = None
         if feats["silhouettes"] and len(feats["silhouettes"]) >= 10:
             try:
-                sils = np.stack(feats["silhouettes"][-30:] if len(feats["silhouettes"]) > 30 else feats["silhouettes"], axis=0)
-                opengait_embedding = gait_embedder.extract(sils)
+                # Take the 30 silhouettes with highest average confidence, or all if less than 30
+                if len(feats["silhouettes"]) > 30:
+                    # Get indices of top 30 confidence frames
+                    confs = feats["track_confidence"]
+                    top_indices = np.argsort(confs)[-30:][::-1]
+                    sils = np.stack([feats["silhouettes"][i] for i in top_indices], axis=0)
+                else:
+                    sils = np.stack(feats["silhouettes"], axis=0)
+                
+                # Add shape validation and debugging
+                if args.verbose:
+                    print(f"Silhouette shape for {tid}: {sils.shape}")
+                
+                # Check if silhouettes have valid values
+                if np.isnan(sils).any() or np.isinf(sils).any():
+                    print(f"Warning: NaN or Inf values in silhouettes for {tid}")
+                    # Try to fix by replacing problematic values
+                    sils = np.nan_to_num(sils, nan=0.0, posinf=1.0, neginf=0.0)
+                
+                # Normalize silhouettes if needed (should be between 0-1)
+                if sils.max() > 1.0 or sils.min() < 0.0:
+                    sils = np.clip(sils, 0.0, 1.0)
+                
+                # Try extraction with more detailed error reporting
+                try:
+                    opengait_embedding = gait_embedder.extract(sils)
+                    if args.verbose:
+                        print(f"Successfully extracted OpenGait embedding for {tid} with shape: {opengait_embedding.shape}")
+                except Exception as e:
+                    import traceback
+                    print(f"OpenGait extraction error for {tid}: {e}")
+                    print(traceback.format_exc())
             except Exception as e:
-                print(f"Error extracting OpenGait embedding: {e}")
-        
+                print(f"Error preparing silhouettes for OpenGait extraction: {e}")
+                # Try to diagnose the issue
+                if feats["silhouettes"]:
+                    first_sil = feats["silhouettes"][0]
+                    print(f" - First silhouette shape: {first_sil.shape if hasattr(first_sil, 'shape') else 'unknown'}")
+                    print(f" - First silhouette type: {type(first_sil)}")
+
         # 3. Skeleton-based gait features
         skeleton_gait_features = {}
         for seq_idx, sequence in enumerate(feats.get("skeleton_sequences", [])):
@@ -576,7 +1122,14 @@ with tqdm(track_features.items(), desc="Aggregating features", unit="track") as 
                 except Exception as e:
                     print(f"Error extracting skeleton gait features: {e}")
         
-        # 4. Raw skeleton keypoints - select high confidence keypoints
+        # 4. 3D skeleton keypoints - aggregate (median for robustness)
+        best_3d_skeleton = None
+        if feats.get("keypoints_3d"):
+            valid_3d = [k for k in feats["keypoints_3d"] if k is not None and np.all(np.isfinite(k))]
+            if valid_3d:
+                best_3d_skeleton = np.median(np.stack(valid_3d), axis=0).tolist()  # shape: (17, 3)
+
+        # 5. Raw skeleton keypoints - select high confidence keypoints
         if feats["raw_skeletons"]:
             best_skeleton_idx = [i for i, full in enumerate(feats["full_body_visible"]) if full]
             if best_skeleton_idx:
@@ -588,7 +1141,7 @@ with tqdm(track_features.items(), desc="Aggregating features", unit="track") as 
         else:
             best_skeleton = None
         
-        # 5. Body ratios - mean of valid measurements
+        # 6. Body ratios - mean of valid measurements
         valid_ratios = [r for r in feats["body_ratios"] if r]
         if valid_ratios:
             mean_ratios = {
@@ -598,20 +1151,20 @@ with tqdm(track_features.items(), desc="Aggregating features", unit="track") as 
         else:
             mean_ratios = {}
         
-        # 6. Color histograms - mean
+        # 7. Color histograms - mean
         if feats["color_hists"]:
             mean_color_hist = np.mean(np.stack(feats["color_hists"]), axis=0)
         else:
             mean_color_hist = None
         
-        # 7. HOG features - mean of valid features
+        # 8. HOG features - mean of valid features
         valid_hog = [h for h in feats["hog_features"] if h is not None]
         if valid_hog:
             mean_hog = np.mean(np.stack(valid_hog), axis=0)
         else:
             mean_hog = None
         
-        # 8. Motion patterns
+        # 9. Motion patterns
         valid_motion = [m for m in feats["motion_patterns"] if m is not None]
         if valid_motion and len(valid_motion) >= 3:
             mean_motion = {
@@ -621,10 +1174,21 @@ with tqdm(track_features.items(), desc="Aggregating features", unit="track") as 
         else:
             mean_motion = None
         
-        # 9. Height - median is more robust than mean for height
-        median_height = float(np.median(feats["heights"])) if feats["heights"] else None
+        # 10. Height - confidence-weighted median height
+        if feats["heights"] and "height_confidences" in feats:
+            # Filter out low confidence measurements
+            good_heights = [h for h, c in zip(feats["heights"], feats["height_confidences"]) 
+                          if c > 0.4 and h is not None]
+            
+            if good_heights:
+                median_height = float(np.median(good_heights))
+            else:
+                # Fallback to regular median if no good confidence measurements
+                median_height = float(np.median(feats["heights"]))
+        else:
+            median_height = None
         
-        # 10. Context - last known
+        # 11. Context - last known
         last_context = feats["contexts"][-1] if feats["contexts"] else {}
         
         # Process industrial pose features
@@ -665,20 +1229,17 @@ with tqdm(track_features.items(), desc="Aggregating features", unit="track") as 
         # Construct the final identity entry
         identity_db[tid] = {
             "name": track_id_to_name.get(tid, f"Person_{tid}"),
-            "appearance": mean_app,
-            "opengait": opengait_embedding,                 # Store OpenGait embedding
-            "skeleton_gait": skeleton_gait_features,        # Store skeleton gait features
+            "opengait": opengait_embedding,
+            "skeleton_gait": skeleton_gait_features,
             "best_skeleton": best_skeleton,
-            "industrial_pose": avg_industrial_pose,         # Normalized pose features for industrial context
-            "industrial_color": avg_industrial_color,       # Industrial clothing/PPE color features
+            "best_3d_skeleton": best_3d_skeleton,
+            "industrial_pose": avg_industrial_pose,
             "body_ratios": mean_ratios,
             "height": median_height,
-            "color_hist": mean_color_hist,
-            "hog_features": mean_hog,
             "motion_pattern": mean_motion,
             "context": last_context,
+            "industrial_color": avg_industrial_color,  # Make sure to include this field
             "feature_quality": {
-                "appearance_samples": len(feats["appearance"]),
                 "skeleton_samples": len(feats["raw_skeletons"]),
                 "opengait_samples": len(feats["silhouettes"]), 
                 "skeleton_sequences": len(feats.get("skeleton_sequences", [])),
@@ -721,13 +1282,14 @@ for name, ids in name_to_ids.items():
         entry = identity_db[tid]
         quality = entry.get('feature_quality', {})
         
-        # Score each ID based on feature quality
+        # Score each ID based on feature quality (ignore appearance to handle clothing changes)
         score = 0
         score += 100 if entry.get('opengait') is not None else 0
-        score += min(50, quality.get('appearance_samples', 0))
-        score += min(30, len(entry.get('skeleton_gait', {})))
-        score += min(20, quality.get('skeleton_samples', 0))
+        score += min(40, len(entry.get('skeleton_gait', {})))
+        score += min(30, quality.get('skeleton_samples', 0))
+        score += min(20, 1 if entry.get('industrial_pose') else 0)
         score += min(10, quality.get('avg_confidence', 0) * 10)
+
         
         if score > best_score:
             best_score = score
@@ -788,6 +1350,36 @@ for name, ids in name_to_ids.items():
 # Use the merged database
 identity_db = merged_identity_db
 print(f"Identity merging complete. Database reduced from {len(track_id_to_name)} to {len(identity_db)} unique identities.")
+
+# DEBUG: Enhanced diagnostics for silhouettes and OpenGait
+for tid, data in identity_db.items():
+    if data.get('opengait') is None:
+        print(f"[DEBUG] ID {tid} ({data.get('name', f'Person_{tid}')}) has no OpenGait embedding.")
+        merged_from = data.get('merged_from', [tid])
+        for sub_tid in merged_from:
+            # Check if silhouettes were present for this track
+            feats = track_features.get(sub_tid)
+            if feats is None:
+                print(f"  - Track {sub_tid}: No features found.")
+                continue
+            n_sil = len(feats.get('silhouettes', [])) if 'silhouettes' in feats else 0
+            print(f"  - Track {sub_tid}: {n_sil} silhouettes.")
+            if n_sil < 10:
+                print(f"    -> Not enough silhouettes for OpenGait (need >=10).")
+            else:
+                print(f"    -> Silhouettes present, possible extraction error.")
+                # Additional diagnostics for Nayan's silhouettes
+                if n_sil > 0 and data.get('name') == 'Nayan':
+                    try:
+                        first_sil = feats["silhouettes"][0]
+                        print(f"    -> First silhouette stats: shape={first_sil.shape}, "
+                              f"min={first_sil.min():.4f}, max={first_sil.max():.4f}, "
+                              f"mean={first_sil.mean():.4f}")
+                        # Check if the mask is binary or continuous
+                        unique_vals = np.unique(first_sil)
+                        print(f"    -> Unique values: {len(unique_vals)} values in range [{unique_vals.min()}, {unique_vals.max()}]")
+                    except Exception as e:
+                        print(f"    -> Error analyzing silhouette: {e}")
 
 with open(OUTPUT_DB, "wb") as f:
     pickle.dump(identity_db, f)

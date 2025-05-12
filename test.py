@@ -56,8 +56,8 @@ YOLO_WEIGHTS = "weights/yolo11x.pt"
 YOLOSEG_WEIGHTS = "weights/yolo11x-seg.pt"
 # TRANSREID_WEIGHTS = "weights/transreid_vitbase.pth"
 MMPOSE_WEIGHTS = "weights/rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611.pth"
-GAIT_WEIGHTS = "checkpoints/GaitBase_DA-60000.pt"
-VIDEPOSE3D_WEIGHTS = os.path.abspath(os.path.join('', 'checkpoints/pretrained_h36m_cpn.bin'))
+GAIT_WEIGHTS = "weights/GaitBase_DA-60000.pt"
+VIDEPOSE3D_WEIGHTS = os.path.abspath(os.path.join('', 'weights/pretrained_h36m_cpn.bin'))
 DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
 yolo_logger.setLevel(logging.WARNING)
@@ -762,7 +762,7 @@ def calculate_iou(boxA, boxB): # From previous script
 def initialize_all_models():
     global yolo_tracker_model, gait_embedder_model, yoloseg_model, videopose3d_model
     print("Initializing models for video annotation...")
-    yolo_tracker_model = YOLOv8Tracker(YOLO_WEIGHTS, device=DEVICE, conf_threshold=0.35) # Use tracker
+    yolo_tracker_model = YOLOv8Tracker(YOLO_WEIGHTS, device=DEVICE, conf_threshold=0.25) # Use tracker
     gait_embedder_model = OpenGaitEmbedder(weights_path=GAIT_WEIGHTS, device=DEVICE)
     try:
         yoloseg_model = YOLOSeg(YOLOSEG_WEIGHTS) # verbose=False by default if not supported
@@ -1444,17 +1444,12 @@ def process_video_for_identification(video_path, database_path, output_video_pat
             # Then run traditional conflict resolution for any remaining issues
             identity_manager.resolve_low_confidence_conflicts(confidence_threshold=0.5)
             
-            # Fix any remaining identity conflicts by forcing uniqueness
+            # Always enforce uniqueness for all identities after optimization and conflict resolution
             conflicts = identity_manager.get_identity_conflicts()
-            if conflicts:
+            for identity_name in list(conflicts.keys()):
+                identity_manager.force_unique_identity(identity_name)
                 if args.verbose:
-                    print(f"Detected identity conflicts: {conflicts.keys()}")
-                    
-                # Force uniqueness for each conflicting identity
-                for identity_name in conflicts.keys():
-                    identity_manager.force_unique_identity(identity_name)
-                    if args.verbose:
-                        print(f"Enforced uniqueness for identity: {identity_name}")
+                    print(f"Enforced uniqueness for identity: {identity_name}")
         
         # Add identity visualization panel if requested
         if args.show_identity_panel:
@@ -1517,11 +1512,11 @@ def process_video_for_identification(video_path, database_path, output_video_pat
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Identify and annotate persons in a video.')
     parser.add_argument('--input_video', required=True, help='Path to the input video file.')
-    parser.add_argument('--output_video', default="output_annotated.mp4", help='Path to save the annotated video.')
-    parser.add_argument('--database', default="identity_database.pkl", help='Path to the identity database file.')
+    parser.add_argument('--output_video', default="output_annotated3c_fixed.mp4", help='Path to save the annotated video.')
+    parser.add_argument('--database', default="filtered_identity_database.pkl", help='Path to the identity database file.')
     parser.add_argument('--verbose', action='store_true', help='Show detailed processing logs.')
     parser.add_argument('--no_display', action='store_true', help='Do not display video frames during processing.')
-    parser.add_argument('--start_frame', type=int, default=350, help='Frame number to start processing from (0-indexed).')
+    parser.add_argument('--start_frame', type=int, default=150, help='Frame number to start processing from (0-indexed).')
     # Parameters for tuning track identification:
     parser.add_argument('--min_frames_for_id', type=int, default=15, help='Min frames of data for a track before first ID attempt.')
     parser.add_argument('--id_interval', type=int, default=45, help='Frame interval for re-identification attempts on a track.')
@@ -1529,7 +1524,7 @@ if __name__ == "__main__":
     parser.add_argument('--track_timeout', type=int, default=90, help='Frames a track can be unseen before being removed.')
     # Debug options
     parser.add_argument('--debug_view', action='store_true', help='Show feature scores on video for debugging.')
-    parser.add_argument('--feature_threshold', type=float, default=0.3, help='Minimum score to include a feature in identification.')
+    parser.add_argument('--feature_threshold', type=float, default=0.2, help='Minimum score to include a feature in identification.')
     # Identity Manager options
     parser.add_argument('--conflict_threshold', type=float, default=0.15, help='Threshold for detecting identity conflicts between tracks.')
     parser.add_argument('--show_identity_panel', action='store_true', help='Show identity assignments visualization panel.')

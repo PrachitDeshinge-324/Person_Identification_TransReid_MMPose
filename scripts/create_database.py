@@ -57,7 +57,7 @@ except Exception as e:
     TemporalModel = None
 
 # Load VideoPose3D model (single model, not ensemble)
-VIDEPOSE3D_CHECKPOINT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../checkpoints/pretrained_h36m_cpn.bin'))
+VIDEPOSE3D_CHECKPOINT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../weights/pretrained_h36m_cpn.bin'))
 VIDEPOSE3D_MODEL = None
 
 if TemporalModel is not None and os.path.exists(VIDEPOSE3D_CHECKPOINT):
@@ -279,13 +279,14 @@ def lift_2d_to_3d(keypoints_2d_seq):
           
 # Add argument parser for command-line options
 parser = argparse.ArgumentParser(description='Create enhanced identity database from video.')
-parser.add_argument('--video', default="input/My Movie.mp4", help='Path to video file')
-parser.add_argument('--output', default="identity_database.pkl", help='Output database file')
+parser.add_argument('--video', default="input/p.mp4", help='Path to video file')
+parser.add_argument('--output', default="identity_database_p.pkl", help='Output database file')
 parser.add_argument('--interactive', action='store_true', help='Use interactive naming')
 parser.add_argument('--auto-name', action='store_true', help='Use automatic naming with predefined map')
-parser.add_argument('--frames', type=int, default=1000, help='Number of frames to process')
+parser.add_argument('--frames', type=int, default=400, help='Number of frames to process')
 parser.add_argument('--skip', type=int, default=1, help='Frame skip rate')
 parser.add_argument('--verbose', action='store_true', help='Show detailed processing logs')
+parser.add_argument('--start-frame', type=int, default=0, help='Frame index to start processing from')
 args = parser.parse_args()
 
 VIDEO_PATH = args.video
@@ -293,7 +294,7 @@ YOLO_WEIGHTS = "weights/yolo11x.pt"
 YOLOSEG_WEIGHTS = "weights/yolo11x-seg.pt"
 TRANSREID_WEIGHTS = "weights/transreid_vitbase.pth"
 MMPOSE_WEIGHTS = "weights/rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611.pth"
-GAIT_WEIGHTS = "checkpoints/GaitBase_DA-60000.pt"
+GAIT_WEIGHTS = "weights/GaitBase_DA-60000.pt"
 OUTPUT_DB = args.output
 DEVICE = "mps"  # or "cuda" or "cpu"
 
@@ -356,6 +357,11 @@ print(f"Processing video: {VIDEO_PATH}")
 cap = cv2.VideoCapture(VIDEO_PATH)
 frame_idx = 0
 frame_count = 0
+
+# Skip frames until start-frame
+if args.start_frame > 0:
+    cap.set(cv2.CAP_PROP_POS_FRAMES, args.start_frame)
+    frame_idx = args.start_frame
 
 # Get total frame count for progress bar
 total_frames = min(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) // args.skip, args.frames)
@@ -912,6 +918,7 @@ if args.auto_name:
 # Option 2: Interactive naming with visual inspection
 elif args.interactive:
     print("Starting interactive naming...")
+    unnamed_tracks = []
     for tid, feats in track_features.items():
         # Try to get a good representative image for the track
         if feats["crops"]:
@@ -928,7 +935,6 @@ elif args.interactive:
             
             # Show skeleton visualization if available
             if feats["raw_skeletons"] and best_idx < len(feats["raw_skeletons"]) and feats["raw_skeletons"][best_idx]:
-                plt.subplot(1, 2, 2)
                 # Create a blank image for skeleton visualization
                 blank = np.ones((256, 256, 3), dtype=np.uint8) * 255
                 kpts = feats["raw_skeletons"][best_idx]
@@ -971,6 +977,7 @@ elif args.interactive:
                                 cv2.circle(blank, (x, y), 3, (0, 255, 0), -1)
                                 cv2.putText(blank, str(i), (x+2, y+2), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
                 
+                plt.subplot(1, 2, 2)
                 plt.imshow(blank)
                 plt.title("Skeleton")
                 plt.axis('off')
@@ -980,23 +987,76 @@ elif args.interactive:
         
         # Suggest the predefined name if available
         suggested_name = NAME_MAPPING.get(tid, f"Person_{tid}")
-        name = input(f"Enter name for track ID {tid} (suggested: {suggested_name}, or 'X' to discard): ")
+        name = input(f"Enter name for track ID {tid} (suggested: {suggested_name}, or 'X' to review all crops): ")
         
-        if name.strip().lower() == 'x':
-            # Save the best crop for manual review, then skip this track
-            import os
-            out_dir = os.path.join('output', 'discarded_tracks')
+        if name.strip().lower() == 'x' or not name.strip():
+            # Save all crops and skeleton visualizations for manual review
+            out_dir = os.path.join('output', 'unnamed_tracks', f'track_{tid}')
             os.makedirs(out_dir, exist_ok=True)
-            if feats["crops"]:
-                out_path = os.path.join(out_dir, f"track_{tid}.jpg")
-                cv2.imwrite(out_path, best_crop)
-                print(f"Track {tid} discarded. Best crop saved to {out_path}.")
+            
+            # Save all crops
+            for idx, crop in enumerate(feats["crops"]):
+                crop_path = os.path.join(out_dir, f"crop_{idx}.jpg")
+                cv2.imwrite(crop_path, crop)
+            
+            # Save all skeleton visualizations
+            for idx, kpts in enumerate(feats["raw_skeletons"]):
+                if kpts is not None:
+                    blank = np.ones((256, 256, 3), dtype=np.uint8) * 255
+                    valid_kpts = [(int(k[0]), int(k[1])) for k in kpts if k[2] > 0]
+                    if valid_kpts:
+                        min_x = min([k[0] for k in valid_kpts])
+                        max_x = max([k[0] for k in valid_kpts])
+                        min_y = min([k[1] for k in valid_kpts])
+                        max_y = max([k[1] for k in valid_kpts])
+                        scale = 200 / max(max_x - min_x, max_y - min_y, 1)
+                        offset_x = 128 - (min_x + max_x) * scale / 2
+                        offset_y = 128 - (min_y + max_y) * scale / 2
+                        # Draw connections
+                        connections = [
+                            (0, 1), (1, 2), (2, 3), (3, 4),
+                            (0, 5), (5, 6), (6, 7),
+                            (0, 8), (8, 9), (9, 10),
+                            (0, 11), (11, 12), (12, 13),
+                        ]
+                        for connection in connections:
+                            if kpts[connection[0]][2] > 0.2 and kpts[connection[1]][2] > 0.2:
+                                pt1 = (int(kpts[connection[0]][0] * scale + offset_x), int(kpts[connection[0]][1] * scale + offset_y))
+                                pt2 = (int(kpts[connection[1]][0] * scale + offset_x), int(kpts[connection[1]][1] * scale + offset_y))
+                                cv2.line(blank, pt1, pt2, (0, 0, 255), 2)
+                        for i, kpt in enumerate(kpts):
+                            if kpt[2] > 0.2:
+                                x = int(kpt[0] * scale + offset_x)
+                                y = int(kpt[1] * scale + offset_y)
+                                cv2.circle(blank, (x, y), 3, (0, 255, 0), -1)
+                                cv2.putText(blank, str(i), (x+2, y+2), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 0), 1)
+                    skeleton_path = os.path.join(out_dir, f"skeleton_{idx}.jpg")
+                    cv2.imwrite(skeleton_path, blank)
+            
+            print(f"Track {tid}: All crops and skeletons saved to {out_dir}")
+            print(f"Please review the saved images at {out_dir}")
+            
+            # Ask for name again after saving crops for review
+            second_name = input(f"After reviewing crops, enter name for track {tid} (or 'X' to discard): ")
+            
+            if second_name.strip().lower() == 'x' or not second_name.strip():
+                print(f"Track {tid} has been discarded.")
+                unnamed_tracks.append((tid, out_dir))
+                continue  # Skip this track, don't add to track_id_to_name
             else:
-                print(f"Track {tid} discarded. No crop available to save.")
-            continue  # Do not add to track_id_to_name, so it will be skipped in DB
-        
-        # Use the input name if provided, otherwise use the suggested name
-        track_id_to_name[tid] = name.strip() if name.strip() else suggested_name
+                # Use the second attempt name
+                track_id_to_name[tid] = second_name.strip()
+                print(f"Track {tid} named as '{second_name.strip()}'")
+        else:
+            # Use the first name provided
+            track_id_to_name[tid] = name.strip()
+            print(f"Track {tid} named as '{name.strip()}'")
+    
+    # Print summary of any tracks that were still unnamed after the second chance
+    if unnamed_tracks:
+        print("\nThe following tracks were skipped and will not be included in the database:")
+        for tid, folder in unnamed_tracks:
+            print(f"  Track {tid}: {folder}")
 
 # Option 3: Default - use predefined mapping without interactive prompts
 else:
@@ -1062,39 +1122,76 @@ with tqdm(track_features.items(), desc="Aggregating features", unit="track") as 
             try:
                 # Take the 30 silhouettes with highest average confidence, or all if less than 30
                 if len(feats["silhouettes"]) > 30:
-                    # Get indices of top 30 confidence frames
                     confs = feats["track_confidence"]
                     top_indices = np.argsort(confs)[-30:][::-1]
-                    sils = np.stack([feats["silhouettes"][i] for i in top_indices], axis=0)
+                    sils = [feats["silhouettes"][i] for i in top_indices]
                 else:
-                    sils = np.stack(feats["silhouettes"], axis=0)
-                
-                # Add shape validation and debugging
-                if args.verbose:
-                    print(f"Silhouette shape for {tid}: {sils.shape}")
-                
-                # Check if silhouettes have valid values
-                if np.isnan(sils).any() or np.isinf(sils).any():
-                    print(f"Warning: NaN or Inf values in silhouettes for {tid}")
-                    # Try to fix by replacing problematic values
-                    sils = np.nan_to_num(sils, nan=0.0, posinf=1.0, neginf=0.0)
-                
-                # Normalize silhouettes if needed (should be between 0-1)
-                if sils.max() > 1.0 or sils.min() < 0.0:
-                    sils = np.clip(sils, 0.0, 1.0)
-                
-                # Try extraction with more detailed error reporting
+                    sils = feats["silhouettes"]
+
+                # Always resize and stack silhouettes to (N, 128, 88) float32
                 try:
-                    opengait_embedding = gait_embedder.extract(sils)
+                    # Better debug info for initial silhouette before processing
+                    if args.verbose or True:
+                        if sils and len(sils) > 0:
+                            first_sil = sils[0]
+                            print(f"[OpenGait DEBUG] Track {tid}: original silhouette shape: {first_sil.shape if first_sil is not None else 'None'}")
+                        else:
+                            print(f"[OpenGait DEBUG] Track {tid}: silhouettes list is empty!")
+                    
+                    # Process each silhouette - ensure correct shape and binary values
+                    processed_sils = []
+                    for sil in sils:
+                        # Convert silhouette to binary mask if it's not already
+                        if isinstance(sil, np.ndarray) and sil.ndim == 2:
+                            # Already 2D array
+                            binary_sil = (sil > 0.5).astype(np.float32)
+                        else:
+                            print(f"[OpenGait DEBUG] Track {tid}: unexpected silhouette type: {type(sil)}")
+                            continue
+                        # Resize to expected OpenGait input size
+                        resized_sil = cv2.resize(binary_sil, (88, 128), interpolation=cv2.INTER_NEAREST)
+                        processed_sils.append(resized_sil)
+                    
+                    if len(processed_sils) < 10:
+                        print(f"[OpenGait DEBUG] Track {tid}: Too few valid silhouettes after filtering: {len(processed_sils)}. Skipping OpenGait extraction for this track.")
+                        opengait_embedding = None
+                        continue
+                    
+                    # Stack processed silhouettes
+                    sils_resized = np.stack(processed_sils, axis=0)
+                    
+                    if args.verbose or True:
+                        print(f"[OpenGait DEBUG] Track {tid}: Final processed array - shape: {sils_resized.shape}, dtype: {sils_resized.dtype}, min: {sils_resized.min()}, max: {sils_resized.max()}")
+                    
+                    # Try extraction with more detailed error reporting
+                    opengait_embedding = gait_embedder.extract(sils_resized)
                     if args.verbose:
                         print(f"Successfully extracted OpenGait embedding for {tid} with shape: {opengait_embedding.shape}")
                 except Exception as e:
-                    import traceback
                     print(f"OpenGait extraction error for {tid}: {e}")
                     print(traceback.format_exc())
+                    
+                    # Try a fallback approach with more explicit tensor handling
+                    try:
+                        print(f"[OpenGait DEBUG] Trying fallback extraction approach for {tid}...")
+                        # Convert to tensor manually with explicit dimensions
+                        tensor_input = torch.from_numpy(sils_resized).float()
+                        # Ensure shape is (N, 1, H, W) - add channel dimension if needed
+                        if tensor_input.dim() == 3:  # If (N, H, W)
+                            tensor_input = tensor_input.unsqueeze(1)  # Add channel dim -> (N, 1, H, W)
+                        print(f"[OpenGait DEBUG] Tensor input shape: {tensor_input.shape}")
+                        tensor_input = tensor_input.to(gait_embedder.device)
+                        # Run inference directly using the model
+                        with torch.no_grad():
+                            feat = gait_embedder.model(tensor_input)
+                            embedding = feat.mean(dim=[0, 2, 3]).cpu().numpy()
+                            print(f"[OpenGait DEBUG] Success! Embedding shape: {embedding.shape}")
+                            opengait_embedding = embedding
+                    except Exception as fallback_error:
+                        print(f"Fallback extraction also failed for {tid}: {fallback_error}")
+                        print(traceback.format_exc())
             except Exception as e:
                 print(f"Error preparing silhouettes for OpenGait extraction: {e}")
-                # Try to diagnose the issue
                 if feats["silhouettes"]:
                     first_sil = feats["silhouettes"][0]
                     print(f" - First silhouette shape: {first_sil.shape if hasattr(first_sil, 'shape') else 'unknown'}")

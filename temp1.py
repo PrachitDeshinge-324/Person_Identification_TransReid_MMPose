@@ -19,7 +19,7 @@ from VideoPose3D.common.model import TemporalModel
 from VideoPose3D.common.camera import normalize_screen_coordinates
 
 # Load the trained VideoPose3D model
-checkpoint_path = "./checkpoints/pretrained_h36m_cpn.bin"
+checkpoint_path = "./weight/pretrained_h36m_cpn.bin"
 # Initialize model with the same parameters as the pre-trained model
 model = TemporalModel(
     num_joints_in=17,  # Number of input joints (COCO format)

@@ -283,7 +283,7 @@ parser.add_argument('--video', default="input/My Movie.mp4", help='Path to video
 parser.add_argument('--output', default="identity_database.pkl", help='Output database file')
 parser.add_argument('--interactive', action='store_true', help='Use interactive naming')
 parser.add_argument('--auto-name', action='store_true', help='Use automatic naming with predefined map')
-parser.add_argument('--frames', type=int, default=100, help='Number of frames to process')
+parser.add_argument('--frames', type=int, default=1000, help='Number of frames to process')
 parser.add_argument('--skip', type=int, default=1, help='Frame skip rate')
 parser.add_argument('--verbose', action='store_true', help='Show detailed processing logs')
 args = parser.parse_args()
@@ -472,7 +472,6 @@ def _camera_aware_bbox_height(bbox, frame_height, focal, sensor, ref_shoulder):
     px_per_cm = (focal * 10) / (distance * sensor)  # mm to cm conversion
     return (bbox_h / px_per_cm) * 0.9  # Empirical correction factor
 
-# Enhanced features for industrial environments
 def compute_normalized_pose_features(keypoints):
     """
     Compute pose features that are invariant to distance from camera
@@ -576,7 +575,6 @@ def compute_normalized_pose_features(keypoints):
     
     return features
 
-# Function to extract color features focused on industrial workwear
 def extract_industrial_color_features(crop):
     """Extract color features specific to industrial clothing and PPE."""
     if crop is None or crop.size == 0 or crop.shape[0] < 20 or crop.shape[1] < 20:

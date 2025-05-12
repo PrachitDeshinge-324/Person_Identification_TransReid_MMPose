@@ -1,0 +1,1 @@
+python test.py --input_video input/3c.mp4 --output_video output/improved_identification.mp4 --show_candidates --show_identity_panel --global_opt_interval 10

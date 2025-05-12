@@ -205,3 +205,211 @@ def visualize_reid_matches(query_image, gallery_images, similarities, top_k=5):
     vis_img = vis_img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
     plt.close(fig)
     return vis_img
+
+def visualize_identity_assignments_with_candidates(frame, identity_manager, active_tracks_data):
+    """
+    Creates a visualization panel showing current identity assignments with candidate options.
+    
+    Args:
+        frame: The current video frame
+        identity_manager: The global IdentityManager instance
+        active_tracks_data: Dict of track data
+    
+    Returns:
+        Modified frame with an identity assignment panel
+    """
+    # Create a sidebar panel for identity assignments
+    frame_height, frame_width = frame.shape[:2]
+    sidebar_width = 350  # Wider to show candidates
+    panel_height = frame_height
+    
+    # Create a black sidebar
+    sidebar = np.zeros((panel_height, sidebar_width, 3), dtype=np.uint8)
+    
+    # Get all current identity assignments
+    identity_assignments = identity_manager.get_all_identities()
+    
+    # Group tracks by assigned identity
+    identities_to_tracks = {}
+    for track_id, (name, conf) in identity_assignments.items():
+        if name != "Unknown" and name != "Pending...":
+            if name not in identities_to_tracks:
+                identities_to_tracks[name] = []
+            identities_to_tracks[name].append((track_id, conf))
+    
+    # Draw header
+    cv2.putText(sidebar, "Identity Assignments", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+    cv2.line(sidebar, (10, 40), (sidebar_width-10, 40), (100, 100, 100), 1)
+    
+    y_pos = 70
+    
+    # Draw identity assignments, highlighting conflicts
+    for name, tracks in sorted(identities_to_tracks.items()):
+        # Determine color based on whether there's a conflict (multiple tracks)
+        if len(tracks) > 1:
+            # Conflict - red
+            color = (0, 0, 255)
+            status = "CONFLICT"
+        else:
+            # No conflict - green
+            color = (0, 255, 0)
+            status = "OK"
+        
+        # Draw identity name
+        cv2.putText(sidebar, f"{name} ({status})", (10, y_pos), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        y_pos += 25
+        
+        # Draw associated tracks
+        for track_id, conf in tracks:
+            cv2.putText(sidebar, f"  Track {track_id}: {conf:.2f}", (20, y_pos), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 250), 1)
+            y_pos += 20
+            
+            # Show candidate alternatives from top matches
+            if hasattr(identity_manager, 'top_candidates') and track_id in identity_manager.top_candidates:
+                candidates = identity_manager.top_candidates[track_id]
+                for i, (cand_name, cand_conf, _) in enumerate(candidates):
+                    if cand_name != name:  # Only show alternatives
+                        cand_color = (100, 100, 100) if cand_conf < conf else (100, 180, 250)
+                        cv2.putText(sidebar, f"    Alt {i+1}: {cand_name} ({cand_conf:.2f})", 
+                                   (40, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.4, cand_color, 1)
+                        y_pos += 15
+            
+            y_pos += 5
+        
+        y_pos += 10
+    
+    # Add statistics
+    y_pos += 20
+    cv2.putText(sidebar, "Statistics:", (10, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+    y_pos += 25
+    
+    # Count unique identities
+    unique_ids = len(identities_to_tracks)
+    cv2.putText(sidebar, f"Unique IDs: {unique_ids}", (20, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 250), 1)
+    y_pos += 20
+    
+    # Count active tracks
+    active_tracks = len(active_tracks_data)
+    cv2.putText(sidebar, f"Active tracks: {active_tracks}", (20, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 250), 1)
+    y_pos += 20
+    
+    # Count conflicts
+    conflicts = sum(1 for tracks in identities_to_tracks.values() if len(tracks) > 1)
+    cv2.putText(sidebar, f"ID conflicts: {conflicts}", (20, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 250), 1)
+    
+    # Add global optimization status
+    y_pos += 30
+    cv2.putText(sidebar, "Global Optimization:", (10, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+    y_pos += 25
+    
+    # Show optimization status
+    candidates_count = len(identity_manager.top_candidates) if hasattr(identity_manager, 'top_candidates') else 0
+    cv2.putText(sidebar, f"Tracks with candidates: {candidates_count}", (20, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 250), 1)
+    
+    # Combine the original frame with the sidebar
+    combined = np.zeros((frame_height, frame_width + sidebar_width, 3), dtype=np.uint8)
+    combined[:, :frame_width, :] = frame
+    combined[:, frame_width:, :] = sidebar
+    
+    return combined
+
+def visualize_identity_assignments(frame, identity_manager, active_tracks_data):
+    """
+    Creates a visualization panel showing current identity assignments.
+    
+    Args:
+        frame: The current video frame
+        identity_manager: The global IdentityManager instance
+        active_tracks_data: Dict of track data
+    Returns:
+        Modified frame with an identity assignment panel
+    """
+    # Create a sidebar panel for identity assignments
+    frame_height, frame_width = frame.shape[:2]
+    sidebar_width = 280
+    panel_height = frame_height
+    
+    # Create a black sidebar
+    sidebar = np.zeros((panel_height, sidebar_width, 3), dtype=np.uint8)
+    
+    # Get all current identity assignments
+    identity_assignments = identity_manager.get_all_identities()
+    
+    # Group tracks by assigned identity
+    identities_to_tracks = {}
+    for track_id, (name, conf) in identity_assignments.items():
+        if name != "Unknown" and name != "Pending...":
+            if name not in identities_to_tracks:
+                identities_to_tracks[name] = []
+            identities_to_tracks[name].append((track_id, conf))
+    
+    # Draw header
+    cv2.putText(sidebar, "Identity Assignments", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+    cv2.line(sidebar, (10, 40), (sidebar_width-10, 40), (100, 100, 100), 1)
+    
+    y_pos = 70
+    
+    # Draw identity assignments, highlighting conflicts
+    for name, tracks in sorted(identities_to_tracks.items()):
+        # Determine color based on whether there's a conflict (multiple tracks)
+        if len(tracks) > 1:
+            # Conflict - red
+            color = (0, 0, 255)
+            status = "CONFLICT"
+        else:
+            # No conflict - green
+            color = (0, 255, 0)
+            status = "OK"
+        
+        # Draw identity name
+        cv2.putText(sidebar, f"{name} ({status})", (10, y_pos), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        y_pos += 25
+        
+        # Draw associated tracks
+        for track_id, conf in tracks:
+            cv2.putText(sidebar, f"  Track {track_id}: {conf:.2f}", (20, y_pos), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 250), 1)
+            y_pos += 20
+        
+        y_pos += 10
+    
+    # Add statistics
+    y_pos += 20
+    cv2.putText(sidebar, "Statistics:", (10, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
+    y_pos += 25
+    
+    # Count unique identities
+    unique_ids = len(identities_to_tracks)
+    cv2.putText(sidebar, f"Unique IDs: {unique_ids}", (20, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 250), 1)
+    y_pos += 20
+    
+    # Count active tracks
+    active_tracks = len(active_tracks_data)
+    cv2.putText(sidebar, f"Active tracks: {active_tracks}", (20, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 250), 1)
+    y_pos += 20
+    
+    # Count conflicts
+    conflicts = sum(1 for tracks in identities_to_tracks.values() if len(tracks) > 1)
+    cv2.putText(sidebar, f"ID conflicts: {conflicts}", (20, y_pos), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 250), 1)
+    
+    # Combine the original frame with the sidebar
+    combined = np.zeros((frame_height, frame_width + sidebar_width, 3), dtype=np.uint8)
+    combined[:, :frame_width, :] = frame
+    combined[:, frame_width:, :] = sidebar
+    
+    return combined

@@ -14,7 +14,7 @@ from models.kalman import KalmanBoxTracker
 from models.transreid import load_transreid_model
 from models.bytetrack import ByteTrack
 from utils.visualization import draw_tracking_results, get_unique_color
-from utils.pose import extract_skeleton_keypoints, extract_skeleton_batch, get_pose_model
+from utils.pose import extract_skeleton_keypoints_yolopose, extract_skeleton_batch_yolopose
 from utils.gaits import compute_body_ratios, compute_gait_features
 from scipy.spatial.distance import cdist
 from ultralytics import YOLO
@@ -73,7 +73,7 @@ def track_to_track_gait_matching(gait_feature_dir, threshold=0.7):
 class PersonTracker:
     def __init__(self, yolo_weights_path, transreid_weights_path, 
                  device=None, conf_threshold=0.3, reid_threshold=0.7,
-                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False, mmpose_weights=None,
+                 appearance_weight=0.4, gait_weight=0.15, body_weight=0.15, color_weight=0.2, height_weight=0.1, context_weight=0.05, debug_visualize=False,
                  tracker_type='kalman', realtime=False):
         """Initialize the person tracker with robust tracking capabilities"""
         # Use the best available device if none specified
@@ -125,9 +125,6 @@ class PersonTracker:
         self.skeleton_total_count = 0
         self.last_debug_info = {}
         
-        # MMPose weights
-        self.mmpose_weights = mmpose_weights
-
         # Tracker type and real-time mode
         self.tracker_type = tracker_type
         self.realtime = realtime
@@ -439,10 +436,8 @@ class PersonTracker:
             return {}
         # collect IDs, bboxes, confidences
         ids, bboxes, confs = zip(*[(tid, bbox, conf) for tid, bbox, conf in yolo_results])
-        # run one MMPose call for all bboxes
-        keypoints_list = extract_skeleton_batch(frame, list(bboxes),
-                                                weights=self.mmpose_weights,
-                                                device=self.device)
+        # run one YOLOv8-pose call for all bboxes
+        keypoints_list = extract_skeleton_batch_yolopose(frame, list(bboxes), device=self.device)
 
         # build enriched detections
         detections = []
@@ -806,7 +801,7 @@ def process_video(video_path, output_path, yolo_weights, transreid_weights,
     # Initialize tracker with auto device selection
     tracker = PersonTracker(yolo_weights, transreid_weights, device=device,
                            conf_threshold=conf_threshold, reid_threshold=reid_threshold,
-                           appearance_weight=appearance_weight, gait_weight=gait_weight, body_weight=body_weight, color_weight=color_weight, height_weight=height_weight, context_weight=context_weight, debug_visualize=debug_visualize, mmpose_weights=mmpose_weights, tracker_type=tracker_type, realtime=realtime)
+                           appearance_weight=appearance_weight, gait_weight=gait_weight, body_weight=body_weight, color_weight=color_weight, height_weight=height_weight, context_weight=context_weight, debug_visualize=debug_visualize, tracker_type=tracker_type, realtime=realtime)
     
     frame_idx = 0
     while cap.isOpened() and frame_idx < 5000:
@@ -859,7 +854,6 @@ if __name__ == "__main__":
     parser.add_argument('--height_weight', type=float, default=0.1, help='Weight for height similarity')
     parser.add_argument('--context_weight', type=float, default=0.05, help='Weight for context similarity')
     parser.add_argument('--debug_visualize', action='store_true', help='Enable debug visualization of matching scores')
-    parser.add_argument('--mmpose_weights', type=str, default='weights/rtmpose-l_8xb256-420e_humanart-256x192-389f2cb0_20230611.pth', help='Path to MMPose weights')
     parser.add_argument('--show_window', action='store_true', help='Show OpenCV window with imshow (for debugging)')
     parser.add_argument('--tracker', type=str, default='kalman', choices=['kalman', 'bytetrack'], help='Tracking algorithm to use (kalman or bytetrack)')
     parser.add_argument('--realtime', action='store_true', help='Enable real-time mode with frame skipping')
@@ -868,4 +862,4 @@ if __name__ == "__main__":
     
     process_video(args.video, args.output, args.yolo_weights, args.transreid_weights,
                  conf_threshold=args.conf, reid_threshold=args.reid_threshold, device=args.device,
-                 appearance_weight=args.appearance_weight, gait_weight=args.gait_weight, body_weight=args.body_weight, color_weight=args.color_weight, height_weight=args.height_weight, context_weight=args.context_weight, debug_visualize=args.debug_visualize, mmpose_weights=args.mmpose_weights, show_window=args.show_window, tracker_type=args.tracker, realtime=args.realtime)
+                 appearance_weight=args.appearance_weight, gait_weight=args.gait_weight, body_weight=args.body_weight, color_weight=args.color_weight, height_weight=args.height_weight, context_weight=args.context_weight, debug_visualize=args.debug_visualize, show_window=args.show_window, tracker_type=args.tracker, realtime=args.realtime)
